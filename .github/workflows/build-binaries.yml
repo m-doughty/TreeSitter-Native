@@ -128,8 +128,14 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update -qq
+          # libc6-dev-arm64-cross is NOT pulled in by gcc-aarch64-linux-gnu
+          # under --no-install-recommends, and without it the cross gcc
+          # falls back to the host's /usr/include — where it dies on
+          # bits/libc-header-start.h, because that header lives in the
+          # x86_64 multiarch directory a cross compiler won't search.
           sudo apt-get install -y --no-install-recommends \
-              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+              libc6-dev-arm64-cross
           mkdir -p "$HOME/xbin"
           ln -sf "$(command -v aarch64-linux-gnu-gcc)"   "$HOME/xbin/cc"
           ln -sf "$(command -v aarch64-linux-gnu-strip)" "$HOME/xbin/strip"
@@ -164,10 +170,18 @@ jobs:
           set -euxo pipefail
           lib="resources/lib/libtreesitter-native.dylib"
           lipo -info "$lib"
-          lipo -info "$lib" | grep -q 'arm64'
-          lipo -info "$lib" | grep -q 'x86_64'
+          # `grep -q` exits at its FIRST match and closes the pipe; the
+          # producer then dies of SIGPIPE, and `set -o pipefail` turns
+          # that into a failed step (exit 74, "write on a pipe with no
+          # reader") even though the artefact is perfectly good. `nm` on
+          # a multi-MB library is always still writing when the match is
+          # found. Plain `grep … >/dev/null` reads to EOF, so the
+          # producer never sees a closed pipe — do not "tidy" these back
+          # to -q.
+          lipo -info "$lib" | grep 'arm64'  >/dev/null
+          lipo -info "$lib" | grep 'x86_64' >/dev/null
           otool -L "$lib"
-          nm -gU "$lib" | grep -q '_tsn_node_size'
+          nm -gU "$lib" | grep '_tsn_node_size' >/dev/null
 
       - name: Verify artefact (Linux)
         if: runner.os == 'Linux'
@@ -179,10 +193,15 @@ jobs:
           # and may refuse a cross-built aarch64 object, while readelf
           # parses any ELF regardless of the host architecture.
           readelf -h "$lib"
-          readelf -h "$lib" | grep -q '${{ matrix.elf-machine }}'
+          # `grep … >/dev/null` rather than `grep -q`: see the macOS
+          # verify step — -q closes the pipe at the first match, the
+          # producer takes a SIGPIPE, and pipefail fails the step.
+          # `readelf --dyn-syms` on this library is easily large enough
+          # to hit it.
+          readelf -h "$lib" | grep '${{ matrix.elf-machine }}' >/dev/null
           # No dependency beyond libc/libm/libpthread/libdl.
           readelf -d "$lib" | grep NEEDED
-          readelf --dyn-syms "$lib" | grep -q ' tsn_node_size'
+          readelf --dyn-syms "$lib" | grep ' tsn_node_size' >/dev/null
 
       - name: Verify artefact (Windows)
         if: runner.os == 'Windows'

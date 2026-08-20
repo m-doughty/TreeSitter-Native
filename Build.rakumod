@@ -835,25 +835,80 @@ class Build {
         self!stage-stubs($dist-path);
     }
 
+    #| Assert a usable C compiler exists before starting a source
+    #| build, and say something actionable when there isn't one.
+    #|
+    #| The probe spawns the compiler DIRECTLY — never via shell(). A CI
+    #| runner that reaches Raku through bash and GITHUB_ENV can arrive
+    #| with no ComSpec in %*ENV, and then shell() fails to start the
+    #| *interpreter*, which is indistinguishable from "no compiler
+    #| installed" unless you look closely (the symptom is a Proc that
+    #| was never spawned, which warns about uninitialized $!path/@!args
+    #| the moment anything touches it). run() needs no interpreter, so
+    #| the only thing left that can fail is the compiler itself.
     method !check-toolchain() {
-        my Str $probe = $*DISTRO.is-win
-            ?? 'cl /? > nul 2>&1'
-            !! 'cc --version > /dev/null 2>&1';
-        unless shell($probe).exitcode == 0 {
-            die qq:to/ERR/;
-                ❌ No C compiler found. Install one of:
-                    macOS:         xcode-select --install
-                    Debian/Ubuntu: sudo apt install build-essential
-                    Fedora:        sudo dnf install gcc
-                    Arch:          sudo pacman -S base-devel
-                    openSUSE:      sudo zypper in gcc
-                    Windows:       install Visual Studio Build Tools (MSVC),
-                                   then build from a Developer Command
-                                   Prompt so cl.exe is on Path (Windows
-                                   spells it `Path`, and %*ENV lookups in
-                                   Raku are case-sensitive).
-                ERR
+        my Bool $win = so $*DISTRO.is-win;
+
+        # Bare `cl` prints its usage banner and exits non-zero, so on
+        # MSVC a successful SPAWN is the signal, not the exit code.
+        # `cc --version` is expected to exit 0.
+        my @probe = $win ?? ('cl',) !! ('cc', '--version');
+
+        my Str $thrown;
+        my $proc = try run |@probe, :out, :err;
+        $thrown = .message with $!;
+
+        # Drain both pipes before looking at .exitcode: an undrained
+        # child can block writing and never be reaped.
+        my Str $out = '';
+        my Str $err = '';
+        with $proc {
+            $out = .out.slurp(:close) // '';
+            $err = .err.slurp(:close) // '';
         }
+
+        # MoarVM reports a spawn that never happened as exitcode -1
+        # rather than throwing when :out/:err are in play, so ">= 0"
+        # is what "a real process ran and exited" looks like.
+        my Bool $spawned = $proc.defined && $proc.exitcode >= 0;
+        my Bool $found   = $spawned && ($win || $proc.exitcode == 0);
+        return if $found;
+
+        my Str $detail = ($err.lines.grep(*.trim).head
+                          // $out.lines.grep(*.trim).head) // '';
+        my Str $why =
+            $thrown.defined ?? "spawn threw: $thrown"
+            !! $spawned     ?? "{@probe[0]} ran but exited { $proc.exitcode }"
+                                 ~ ($detail ?? " — $detail" !! '')
+            !!                 "{@probe[0]} could not be spawned"
+                                 ~ " (no process started"
+                                 ~ ($proc.defined
+                                     ?? ", exitcode { $proc.exitcode })"
+                                     !! ')');
+
+        # Windows spells it `Path` and %*ENV lookups are case-sensitive,
+        # so try every spelling before reporting an empty search path.
+        my Str $raw = %*ENV<PATH> // %*ENV<Path> // %*ENV<path> // '';
+        my @head    = $raw.split($win ?? ';' !! ':', :skip-empty).head(4);
+        my Str $path-note = @head ?? @head.join('  ') !! '(empty or unset)';
+
+        die qq:to/ERR/;
+            ❌ No C compiler found.
+                probe:   { @probe.join(' ') }
+                why:     $why
+                path[4]: $path-note
+            Install one of:
+                macOS:         xcode-select --install
+                Debian/Ubuntu: sudo apt install build-essential
+                Fedora:        sudo dnf install gcc
+                Arch:          sudo pacman -S base-devel
+                openSUSE:      sudo zypper in gcc
+                Windows:       install Visual Studio Build Tools (MSVC),
+                               then build from a Developer Command
+                               Prompt so cl.exe is on Path (Windows
+                               spells it `Path`, and %*ENV lookups in
+                               Raku are case-sensitive).
+            ERR
     }
 
     # --- Shared helpers -------------------------------------------------
