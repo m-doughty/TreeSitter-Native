@@ -821,7 +821,24 @@ class Build {
                 @cmd.append: %tu<src>, "/Fo:{ $obj.absolute }";
             }
             else {
-                @cmd = 'cc', '-O2', '-fPIC', '-std=c11';
+                # -D_DEFAULT_SOURCE is load-bearing on glibc. The
+                # runtime's lib/src/unicode.h expands le16toh() inside
+                # U16_NEXT_LE (via lib/src/portable/endian.h, which is
+                # just #include <endian.h> on Linux), and glibc gates
+                # le16toh and friends behind __USE_MISC — which
+                # -std=c11 switches OFF by defining __STRICT_ANSI__.
+                # The macro then never exists, le16toh becomes an
+                # implicit function declaration, and because a shared
+                # link tolerates undefined symbols by default the .so
+                # builds clean and explodes at the FIRST dlopen with
+                # "undefined symbol: le16toh". Upstream sidesteps this
+                # by building gnu11; we ask for exactly the one feature
+                # set we need instead, keeping strict ISO C11 for our
+                # own code. Inert on macOS (Apple's OSSwap* branch) and
+                # never reached on MSVC, and applied to every TU rather
+                # than just the runtime because the external scanners
+                # include the same runtime headers.
+                @cmd = 'cc', '-O2', '-fPIC', '-std=c11', '-D_DEFAULT_SOURCE';
                 # A universal binary built the same way CI builds it,
                 # so the source path and the prebuilt path produce
                 # interchangeable artefacts. clang compiles each arch
@@ -885,7 +902,19 @@ class Build {
         else {
             # -lm -lpthread -ldl mirrors upstream's own CMake link
             # interface for non-Apple Unix.
-            @link = 'cc', '-shared', '-o', $out.absolute, |@objects,
+            #
+            # -Wl,--no-undefined turns "this .so references a symbol
+            # nothing provides" from an install-time dlopen failure
+            # into a build failure here, where the log says which
+            # symbol and which object. ELF shared links allow undefined
+            # symbols by default, which is how a missing le16toh once
+            # linked cleanly and only died when zef staged the library;
+            # macOS has no such hole (-dynamiclib errors on undefined
+            # symbols unless told otherwise), so this restores the same
+            # guarantee on Linux. The library is self-contained apart
+            # from libc, so nothing legitimately resolves late.
+            @link = 'cc', '-shared', '-Wl,--no-undefined',
+                    '-o', $out.absolute, |@objects,
                     '-lm', '-lpthread', '-ldl';
             @strip = 'strip', '--strip-unneeded', $out.absolute;
         }
