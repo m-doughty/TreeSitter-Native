@@ -18,8 +18,9 @@
 # from source — safe default, just slower (and, here, meaningfully
 # slower: the source path fetches nine tarballs and compiles 17
 # translation units).
-#
-# This file is intentionally entry-less in the 0.1.0 tree: no binary
-# release has been cut yet, so every install compiles from source. The
-# first entries land when the binaries-treesitter-native-0.1.0-r1 tag
-# named in BINARY_TAG is published.
+
+0a7f912cbe3dfe088b81e76314173dcf4cac923ba218057ef0387c6c55e0e9a4  libtreesitter-native-linux-aarch64-glibc.so
+506aac82636da146a32187fc267bd9791a11cf3fcd92d8ec42f4723a8d996eeb  libtreesitter-native-windows-x86_64.dll
+969d7ae2bf93ae347977613fbb3cdedf005c119ceb184e4637a420f44c8230a7  libtreesitter-native-macos-universal.dylib
+9942f54e452eb88b36e6a749f7dc40e6f3dd6f95f4d9feaee80a4185c3b1f53b  libtreesitter-native-windows-arm64.dll
+d9d11bb380a3aba1fdd9389abf67ffd992251cebeed6991a42f6b782910ecc7a  libtreesitter-native-linux-x86_64-glibc.so
