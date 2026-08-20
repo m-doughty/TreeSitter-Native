@@ -1,0 +1,213 @@
+use v6.d;
+use Test;
+
+# Author test: every vendored file is byte-identical to upstream.
+#
+# `resources/queries/` and `resources/licenses/` are copies of files
+# from nine upstream repositories, taken at the tags pinned in
+# SOURCE_PINS. Nothing in the shipped test suite can check that claim —
+# it needs the upstream sources, which are 56MB and are downloaded at
+# install time, not shipped — so the check lives here, in xt/, where a
+# network round trip is allowed. `.gitattributes` pins these files to
+# LF precisely because THIS test compares them byte for byte.
+#
+# The sources come from Build.rakumod's own !ensure-sources, invoked
+# through the metamodel rather than reimplemented: same cache directory
+# (TREESITTER_NATIVE_CACHE_DIR, else XDG), same pins, same SHA-256
+# verification, same TREESITTER_NATIVE_VENDOR_DIR escape hatch. A
+# second copy of that logic here would be a second thing to keep right.
+#
+#     raku -I. xt/01-queries-upstream.rakutest
+#     prove6 -I. xt
+#
+# Needs network on a cold cache. Being unable to reach github.com skips
+# the file comparisons with a diagnostic; anything else — a digest that
+# no longer matches, a tree missing the files we expect — is a failure,
+# because those are exactly the conditions this test exists to catch.
+
+# Which upstream tree each vendored query directory came from. tsx is
+# the interesting one: tree-sitter-typescript ships TWO grammars but
+# only ONE set of queries, at the repository root, and they serve both.
+my @VENDORED =
+    %( lang => 'c',          pin => 'tree-sitter-c'          ),
+    %( lang => 'cpp',        pin => 'tree-sitter-cpp'        ),
+    %( lang => 'go',         pin => 'tree-sitter-go'         ),
+    %( lang => 'java',       pin => 'tree-sitter-java'       ),
+    %( lang => 'javascript', pin => 'tree-sitter-javascript' ),
+    %( lang => 'python',     pin => 'tree-sitter-python'     ),
+    %( lang => 'rust',       pin => 'tree-sitter-rust'       ),
+    %( lang => 'tsx',        pin => 'tree-sitter-typescript' ),
+    %( lang => 'typescript', pin => 'tree-sitter-typescript' ),
+;
+
+# Vendored licence file → (pin, path within that upstream tree).
+my @LICENCES =
+    %( file => 'tree-sitter-LICENSE',
+       pin  => 'tree-sitter',            path => 'LICENSE' ),
+    # The runtime's Unicode property tables are ICU-derived and carry
+    # their own licence, which is why it ships separately from the
+    # runtime's MIT one.
+    %( file => 'tree-sitter-unicode-ICU-LICENSE',
+       pin  => 'tree-sitter',            path => 'lib/src/unicode/LICENSE' ),
+    %( file => 'tree-sitter-c-LICENSE',
+       pin  => 'tree-sitter-c',          path => 'LICENSE' ),
+    %( file => 'tree-sitter-cpp-LICENSE',
+       pin  => 'tree-sitter-cpp',        path => 'LICENSE' ),
+    %( file => 'tree-sitter-go-LICENSE',
+       pin  => 'tree-sitter-go',         path => 'LICENSE' ),
+    %( file => 'tree-sitter-java-LICENSE',
+       pin  => 'tree-sitter-java',       path => 'LICENSE' ),
+    %( file => 'tree-sitter-javascript-LICENSE',
+       pin  => 'tree-sitter-javascript', path => 'LICENSE' ),
+    %( file => 'tree-sitter-python-LICENSE',
+       pin  => 'tree-sitter-python',     path => 'LICENSE' ),
+    %( file => 'tree-sitter-rust-LICENSE',
+       pin  => 'tree-sitter-rust',       path => 'LICENSE' ),
+    %( file => 'tree-sitter-typescript-LICENSE',
+       pin  => 'tree-sitter-typescript', path => 'LICENSE' ),
+;
+
+# --- Locate the distribution ------------------------------------------
+
+my IO::Path $dist = $?FILE.IO.absolute.IO.parent.parent;
+ok $dist.add('META6.json').e, "found the distribution root at $dist";
+ok $dist.add('Build.rakumod').e, 'and Build.rakumod inside it';
+
+# --- Ask Build.rakumod for the upstream trees -------------------------
+
+# Loaded the same way the release workflow's compile step loads it, and
+# the same way zef does: by path, as a compilation unit named Build.
+require "$dist/Build.rakumod";
+my $build-class = ::('Build');
+ok $build-class.HOW.^name.contains('ClassHOW'),
+    'Build.rakumod declares a Build class';
+
+# !ensure-sources is private, which is correct — it is Build's business,
+# not an API. `.^find_private_method` is how a test reaches it without
+# either making it public or copying it. If Build ever renames it, this
+# fails loudly here rather than silently checking nothing.
+my $build  = $build-class.new;
+my &ensure = $build.^find_private_method('ensure-sources');
+ok &ensure.defined,
+    'Build exposes !ensure-sources to the metamodel';
+
+my %trees;
+my $fetch-error;
+if &ensure.defined {
+    # Fetch, verify and extract every pin — or reuse the cache, or the
+    # TREESITTER_NATIVE_VENDOR_DIR trees. All of that is Build's code.
+    try {
+        %trees = ensure($build, $dist.Str);
+        CATCH { default { $fetch-error = $_ } }
+    }
+}
+
+# Network trouble is a skip; a digest mismatch or a tree missing the
+# files we compile is a failure, since catching those is the point.
+my Bool $offline = False;
+with $fetch-error {
+    my Str $msg = .message // '';
+    $offline = so ($msg.contains('Failed to download')
+                || $msg.contains('is required for the source build'));
+    if $offline {
+        diag "Could not reach the upstream sources:";
+        diag $msg.lines.head(4).join("\n");
+    }
+    else {
+        flunk "!ensure-sources failed for a reason that is not the network";
+        diag $msg;
+    }
+}
+
+# --- Compare -----------------------------------------------------------
+
+sub compare-file(IO::Path $vendored, IO::Path $upstream, Str $what) {
+    subtest $what => {
+        ok $upstream.e, "upstream has {$upstream.relative($upstream.parent.parent)}";
+        return unless $upstream.e;
+        ok $vendored.e, 'and this distribution vendors it';
+        return unless $vendored.e;
+
+        my Blob $ours   = $vendored.slurp(:bin);
+        my Blob $theirs = $upstream.slurp(:bin);
+        is $ours.elems, $theirs.elems,
+            "same byte count ({$theirs.elems})";
+        # Compared as bytes, deliberately: a CRLF-mangling checkout or a
+        # BOM would produce identical-looking text and a different file.
+        ok $ours eqv $theirs, 'byte-for-byte identical to upstream';
+        nok $ours.list.grep(0x0d).elems,
+            'and carries no CR bytes (.gitattributes keeps it LF)';
+    };
+}
+
+if $offline {
+    skip 'upstream sources unreachable — cannot compare bytes', 1;
+}
+else {
+    for @VENDORED -> %g {
+        my IO::Path $tree = %trees{%g<pin>};
+        unless $tree.defined && $tree.d {
+            flunk "no extracted tree for %g<pin>";
+            next;
+        }
+        my IO::Path $upstream-dir = $tree.add('queries');
+        my IO::Path $vendor-dir   = $dist.add('resources/queries').add(%g<lang>);
+
+        subtest "queries: %g<lang> (from %g<pin>)" => {
+            ok $upstream-dir.d, 'upstream ships a queries/ directory';
+            ok $vendor-dir.d, 'and this distribution vendors it';
+
+            my @upstream = $upstream-dir.dir(test => *.ends-with('.scm'))
+                                        .map(*.basename).sort;
+            my @ours     = $vendor-dir.dir(test => *.ends-with('.scm'))
+                                      .map(*.basename).sort;
+
+            # Both directions. A missing file would silently shrink the
+            # query surface; an extra one would mean shipping something
+            # upstream does not have under upstream's licence.
+            is @ours.List, @upstream.List,
+                'exactly the same set of .scm files';
+
+            for @ours -> Str $name {
+                compare-file($vendor-dir.add($name),
+                             $upstream-dir.add($name),
+                             "%g<lang>/$name");
+            }
+        };
+    }
+
+    for @LICENCES -> %l {
+        my IO::Path $tree = %trees{%l<pin>};
+        unless $tree.defined && $tree.d {
+            flunk "no extracted tree for %l<pin>";
+            next;
+        }
+        compare-file($dist.add('resources/licenses').add(%l<file>),
+                     $tree.add(%l<path>),
+                     "licence: %l<file>");
+    }
+}
+
+# --- META6 ships exactly what is vendored ------------------------------
+#
+# Independent of the network: a file that is on disk but not in
+# `resources` never reaches an installed copy, and %?RESOURCES would
+# fail for it at runtime.
+
+my %meta = Rakudo::Internals::JSON.from-json($dist.add('META6.json').slurp);
+my @declared = %meta<resources>.grep({
+    .starts-with('queries/') || .starts-with('licenses/')
+}).sort;
+
+my @on-disk = flat
+    @VENDORED.map(-> %g {
+        $dist.add('resources/queries').add(%g<lang>)
+             .dir(test => *.ends-with('.scm'))
+             .map({ "queries/%g<lang>/{.basename}" });
+    }),
+    $dist.add('resources/licenses').dir.map({ "licenses/{.basename}" });
+
+is @declared.List, @on-disk.sort.List,
+    'META6.json resources lists exactly the vendored queries and licences';
+
+done-testing;

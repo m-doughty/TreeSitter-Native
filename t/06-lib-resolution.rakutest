@@ -1,0 +1,176 @@
+use v6.d;
+use Test;
+
+# Offline tests for the native-library resolver — the pure parts of
+# TreeSitter::Native::FFI's lookup. Nothing here calls into the library:
+# every function under test is a function of its arguments, driven with
+# temporary-directory fixtures, so a resolution regression is caught
+# here rather than surfacing as "Cannot locate native library" or, far
+# worse, as a dlopen of the wrong file.
+#
+# The internals are `my sub`s tagged `is export(:INTERNAL)`, which keeps
+# them off the module's public surface while letting this file reach
+# them without EVAL or symbol-table spelunking.
+use TreeSitter::Native::FFI :INTERNAL;
+
+# --- fixture scaffolding ----------------------------------------------
+
+sub nuke(IO::Path $p) {
+    if $p.d {
+        nuke($_) for $p.dir;
+        $p.rmdir;
+    }
+    elsif $p.e || $p.l {
+        $p.unlink;
+    }
+}
+
+my IO::Path $root =
+    $*TMPDIR.add("treesitter-native-resolution-{$*PID}-{now.Int}");
+$root.mkdir;
+END { nuke($root) if $root.d }
+
+sub fixture(Str $name, Str $content --> IO::Path) {
+    my IO::Path $path = $root.add($name);
+    $path.spurt($content);
+    $path;
+}
+
+# --- _lib-extension ---------------------------------------------------
+#
+# Taken as parameters rather than read from $*KERNEL so all three
+# platforms are exercised from whichever one is running the suite.
+# Every supported OS is checked on every host: that is the point.
+
+is _lib-extension('darwin', False), 'dylib', 'macOS gets .dylib';
+is _lib-extension('darwin', True),  'dll',
+    'the Windows flag wins even over a darwin kernel name';
+is _lib-extension('linux', False),  'so',   'Linux gets .so';
+is _lib-extension('freebsd', False), 'so',  'so does anything else';
+is _lib-extension('win32', True),   'dll',  'Windows gets .dll';
+is _lib-extension('mswin32', True), 'dll',  'under either spelling';
+is _lib-extension('DARWIN', False), 'dylib', 'the kernel name is folded';
+
+# --- _lib-basename ----------------------------------------------------
+#
+# These three names are exactly what Build.rakumod stages into
+# resources/lib/ and exactly what META6.json lists as resources. If they
+# drift apart the install silently stages a file nothing looks for.
+
+is _lib-basename('darwin', False), 'libtreesitter-native.dylib',
+    'macOS staged name';
+is _lib-basename('linux', False),  'libtreesitter-native.so',
+    'Linux staged name';
+is _lib-basename('linux', True),   'libtreesitter-native.dll',
+    'Windows staged name';
+
+# --- _pick-libpath: the override --------------------------------------
+
+my IO::Path $real = fixture('libtreesitter-native.dylib', 'not really a library');
+my IO::Path $alt  = fixture('elsewhere.so', 'nor is this');
+
+is _pick-libpath($real.absolute, $alt.absolute), $real.absolute,
+    'TREESITTER_NATIVE_LIB beats the staged library';
+is _pick-libpath("  {$real.absolute}  ", $alt.absolute), $real.absolute,
+    'and is trimmed before use';
+
+# A relative override is refused rather than handed to the loader:
+# NativeCall passes a Callable's return value to dlopen VERBATIM, so a
+# relative path would resolve against the loader's search list, not the
+# current directory — silently, and differently on every OS.
+throws-like { _pick-libpath('libtreesitter-native.dylib', $alt.absolute) },
+    Exception, message => /'must be an absolute path'/,
+    'a relative override is refused';
+
+throws-like { _pick-libpath($root.add('nope.dylib').absolute, $alt.absolute) },
+    Exception, message => /'not a readable file'/,
+    'an override pointing at nothing is refused';
+
+# An unset or blank override falls through to the staged library rather
+# than failing: %*ENV<TREESITTER_NATIVE_LIB> reads back as Any when
+# unset, and as '' when set to nothing by a shell script.
+is _pick-libpath(Str, $alt.absolute), $alt.absolute,
+    'an unset override falls through';
+is _pick-libpath('', $alt.absolute), $alt.absolute,
+    'an empty override falls through';
+is _pick-libpath('   ', $alt.absolute), $alt.absolute,
+    'a whitespace override falls through';
+
+# --- _pick-libpath: the staged library --------------------------------
+
+is _pick-libpath(Str, $alt.absolute), $alt.absolute,
+    'the staged path is returned as-is when it is a real file';
+ok _pick-libpath(Str, $alt.absolute).IO.is-absolute,
+    'and is always absolute';
+
+throws-like { _pick-libpath(Str, Str) },
+    Exception, message => /'was not found'/,
+    'a missing staged path is a clear error, not a dlopen failure';
+
+throws-like { _pick-libpath(Str, $root.add('absent.so').absolute) },
+    Exception, message => /'was not found'/,
+    'and so is a staged path that does not exist';
+
+# Build.rakumod parks EMPTY placeholder files under the two library
+# names this platform is not, so META6's resources list stays
+# satisfiable everywhere. Loading one would fail inside dlopen with
+# something unhelpful about an invalid image; catch it here instead,
+# and say what it actually means.
+my IO::Path $stub = fixture('libtreesitter-native.stub', '');
+is $stub.s, 0, 'the placeholder fixture really is empty';
+throws-like { _pick-libpath(Str, $stub.absolute) },
+    Exception, message => /'is empty'/,
+    'an empty placeholder is refused with an explanation';
+throws-like { _pick-libpath(Str, $stub.absolute) },
+    Exception, message => /'placeholder'/,
+    'that names the placeholder for what it is';
+
+# A directory is not a library either.
+throws-like { _pick-libpath(Str, $root.absolute) },
+    Exception, message => /'was not found'/,
+    'a directory is refused';
+throws-like { _pick-libpath($root.absolute, $alt.absolute) },
+    Exception, message => /'not a readable file'/,
+    'including as an override';
+
+# --- _libpath ---------------------------------------------------------
+#
+# The live resolver, which by now has already run: the module-load
+# assertion in FFI.rakumod called into the library to check
+# sizeof(TSNode). Assert its shape rather than its value.
+
+my Str $resolved = _libpath();
+ok $resolved.defined && $resolved.chars, '_libpath resolves to something';
+ok $resolved.IO.is-absolute, 'which is an absolute path';
+ok $resolved.IO.f, 'and a real file';
+ok $resolved.IO.s > 0, 'with something in it';
+is _libpath(), $resolved, 'and repeated calls agree (the cache holds)';
+
+# Deliberately NOT an assertion about the filename. Under `-I.` the
+# resolved path is resources/lib/libtreesitter-native.<ext>, but an
+# INSTALLED distribution keeps its resources in a content-addressed
+# store, where the same file is named after its SHA-256. The name is
+# the repository's business; what matters is that the bytes are a
+# shared library this platform's loader will accept.
+my Blob $magic = $resolved.IO.open(:bin).read(4);
+my @magic = $magic.list;
+my Bool $recognised = do given $*KERNEL.name.lc {
+    when $*DISTRO.is-win { @magic[0] == 0x4D && @magic[1] == 0x5A }
+    when /darwin/ {
+        #      fat (universal)          |  Mach-O 64          |  32
+        (@magic[0] == 0xCA && @magic[1] == 0xFE)
+            || (@magic[0] == 0xCF && @magic[1] == 0xFA)
+            || (@magic[0] == 0xCE && @magic[1] == 0xFA)
+            || (@magic[0] == 0xBE && @magic[1] == 0xBA);
+    }
+    default {
+        @magic[0] == 0x7F && @magic[1] == 0x45
+            && @magic[2] == 0x4C && @magic[3] == 0x46;   # \x7FELF
+    }
+};
+ok $recognised,
+    'and they start with a shared-library magic number this platform '
+    ~ 'understands (got '
+    ~ @magic.map(*.fmt('%02x')).join(' ') ~ ')';
+
+done-testing;

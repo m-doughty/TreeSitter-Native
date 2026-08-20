@@ -1,0 +1,119 @@
+use v6.d;
+use Test;
+use TreeSitter::Native;
+use TreeSitter::Native::FFI;
+use TreeSitter::Native::Languages;
+
+# Parser and Tree: construction, language selection, both parse entry
+# points, and the accessors a caller reaches for immediately afterwards.
+
+# --- Construction and language selection ------------------------------
+
+my $bare = Parser.new;
+isa-ok $bare, Parser, 'Parser.new with no argument gives a parser';
+nok $bare.language.defined, 'with no grammar set yet';
+nok $bare.disposed, 'and not disposed';
+
+throws-like { $bare.parse('x = 1') }, Exception,
+    message => /'no grammar set'/,
+    'parsing before setting a grammar is an error, not a crash';
+
+$bare.set-language('python');
+ok $bare.language.defined, 'set-language by name takes';
+
+my $direct = Parser.new;
+$direct.set-language(language('rust'));
+ok $direct.language.defined, 'set-language by TSLanguage takes';
+
+throws-like { Parser.new.set-language(42) }, Exception,
+    message => /'grammar name or a TSLanguage'/,
+    'set-language rejects anything else';
+
+my $preset = Parser.new('go');
+ok $preset.language.defined, 'Parser.new($name) sets the grammar';
+
+# Re-pointing a parser at a different grammar is allowed and takes
+# effect on the next parse.
+$preset.set-language('python');
+is $preset.parse("x = 1\n").root-node.type, 'module',
+    'a parser can be re-aimed at another grammar';
+
+# --- parse(Str) -------------------------------------------------------
+
+my $parser = Parser.new('python');
+my $source = "def f():\n    return 1\n";
+my $tree   = $parser.parse($source);
+
+isa-ok $tree, Tree, 'parse returns a Tree';
+is $tree.source, $source, 'the Tree keeps the Str it was given';
+is $tree.bytes.elems, $source.encode('utf-8').elems,
+    'and the exact bytes it encoded to';
+is $tree.byte-length, $source.encode('utf-8').elems,
+    'byte-length agrees';
+nok $tree.disposed, 'a fresh tree is not disposed';
+
+my $root = $tree.root-node;
+isa-ok $root, Node, 'root-node gives a Node';
+is $root.type, 'module', 'of the expected type';
+is $root.start-byte, 0, 'starting at byte 0';
+is $root.end-byte, $tree.bytes.elems, 'and ending at the last byte';
+nok $root.has-error, 'the fixture parsed cleanly';
+ok $root.is-named, 'the root is a named node';
+
+ok $tree.language.defined, 'the tree knows its grammar';
+
+# --- parse-bytes(Blob) ------------------------------------------------
+
+my Blob $bytes = "def g(): pass\n".encode('utf-8');
+my $btree = $parser.parse-bytes($bytes);
+isa-ok $btree, Tree, 'parse-bytes returns a Tree';
+nok $btree.source.defined,
+    'a parse-bytes tree has no source Str — only bytes';
+is $btree.bytes.elems, $bytes.elems, 'it keeps the bytes it was given';
+is $btree.root-node.named-child(0).type, 'function_definition',
+    'and parses them the same way';
+
+# --- Degenerate input -------------------------------------------------
+
+my $empty = $parser.parse('');
+is $empty.root-node.type, 'module', 'the empty document still parses';
+is $empty.root-node.child-count, 0, 'to a childless root';
+is $empty.bytes.elems, 0, 'with no bytes';
+
+my $empty-bytes = $parser.parse-bytes(Blob.new);
+is $empty-bytes.root-node.type, 'module',
+    'an empty Blob parses the same way';
+
+# tree-sitter never refuses input: it recovers and marks the damage.
+my $broken = $parser.parse("def (:\n  ???\n");
+isa-ok $broken, Tree, 'malformed source still yields a tree';
+ok $broken.root-node.has-error, 'flagged as containing an error';
+ok $broken.root-node.walk.grep({ .is-error || .is-missing }).elems,
+    'with at least one error or missing node inside it';
+
+# --- reset and clone --------------------------------------------------
+
+lives-ok { $parser.reset }, 'reset is callable';
+is $parser.parse("y = 2\n").root-node.type, 'module',
+    'and the parser still works afterwards';
+
+my $clone = $tree.clone;
+isa-ok $clone, Tree, 'clone gives a Tree';
+is $clone.root-node.sexp, $root.sexp, 'with the same shape';
+is $clone.bytes.elems, $tree.bytes.elems, 'over the same bytes';
+$clone.dispose;
+nok $tree.disposed, 'disposing the clone leaves the original alone';
+is $tree.root-node.type, 'module', 'which still works';
+
+# --- Cross-grammar sanity ---------------------------------------------
+#
+# tsx and typescript share a query file but not a grammar: JSX is a
+# syntax error in one and not the other. This is the cheapest proof
+# that the two getters really are wired to two parsers.
+my $jsx = "const A = () => <div />;\n";
+ok Parser.new('tsx').parse($jsx).root-node.has-error.not,
+    'the tsx grammar accepts JSX';
+ok Parser.new('typescript').parse($jsx).root-node.has-error,
+    'the typescript grammar does not';
+
+done-testing;

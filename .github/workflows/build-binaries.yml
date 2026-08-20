@@ -1,0 +1,322 @@
+# Build libtreesitter-native for every supported (OS, arch) pair and
+# publish the artefacts as GitHub Release assets, so `zef install
+# TreeSitter::Native` can download a prebuilt .dylib / .so / .dll
+# instead of compiling nine grammars from source.
+#
+# Triggers:
+#   - workflow_dispatch: manual run while the recipe is still being
+#     shaken down. Start here.
+#   - push: tags matching `binaries-*`: the production path. Push a tag
+#     like `binaries-treesitter-native-0.1.0-r1` (matching the
+#     BINARY_TAG file) and CI produces the release.
+#
+# Binary artefacts are versioned INDEPENDENTLY of the Raku dist
+# version — see Build.rakumod's header comment for the rationale.
+#
+# ---------------------------------------------------------------------
+# Why the compile step drives Build.rakumod instead of running cc/cl
+# ---------------------------------------------------------------------
+#
+# This library is 17 translation units with per-TU include rules: every
+# grammar ships its own ABI-specific `tree_sitter/parser.h`, so the
+# grammars must be compiled with NO shared -I (and typescript/tsx with
+# an -I pointing at their OWN src/). Duplicating that in bash would put
+# the one rule this build exists to enforce in two places, where it can
+# drift silently and produce a library that links and then reads garbage
+# out of a TSLanguage. So CI installs Raku and calls the very same
+# Build.rakumod an end user's `zef install` calls.
+#
+# That costs us the two ARM legs' native runners: Raku/setup-raku@v1 has
+# no aarch64-Linux and no Windows-ARM64 build, and rakudo.org publishes
+# no such archives either (checked 2026-08-20), so a native ARM runner
+# would need a 10-20 minute Rakudo source build — on Windows ARM, with
+# the wrong (MinGW) toolchain for our MSVC + exports.def link. Both ARM
+# artefacts are therefore CROSS-compiled from an x86_64 runner:
+#
+#   linux-aarch64-glibc  ubuntu-22.04 + gcc-aarch64-linux-gnu, exposed
+#                        to Build.rakumod as `cc`/`strip` on PATH.
+#                        Still glibc 2.35, matching $MIN-GLIBC.
+#   windows-arm64        windows-2022 + MSVC amd64_arm64 cross tools.
+#
+# Cross-built artefacts are never executed on the build runner, so each
+# one's machine type is asserted before it is uploaded.
+
+name: build-binaries
+
+on:
+  workflow_dispatch:
+
+  push:
+    tags:
+      - 'binaries-*'
+
+  # Uncomment once builds are stable across all 5 platforms. Until
+  # then, we don't want accidental rebuilds on every src/ edit.
+  # push:
+  #   paths:
+  #     - 'src/**'
+  #     - 'Build.rakumod'
+  #     - 'SOURCE_PINS'
+  #     - '.github/workflows/build-binaries.yml'
+
+permissions:
+  contents: write  # needed to publish release assets
+
+jobs:
+  build:
+    name: build-${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS — one universal (arm64 + x86_64) binary built on the
+          # arm64 runner via Clang's `-arch` flags. GitHub deprecated
+          # Intel macOS runners in 2025; universal builds from arm64
+          # are Apple's native distribution pattern.
+          - os: macos-14
+            platform: macos-universal
+            lib-ext: dylib
+
+          # Linux glibc — Ubuntu 22.04 is the oldest currently-supported
+          # GHA image, giving the broadest glibc compatibility without
+          # needing a manylinux-style container. Bump in lockstep with
+          # $MIN-GLIBC in Build.rakumod when this changes.
+          - os: ubuntu-22.04
+            platform: linux-x86_64-glibc
+            lib-ext: so
+            elf-machine: X86-64
+          - os: ubuntu-22.04
+            platform: linux-aarch64-glibc
+            lib-ext: so
+            cross: aarch64
+            elf-machine: AArch64
+
+          # Windows — MSVC, native x64 and cross-built arm64.
+          - os: windows-2022
+            platform: windows-x86_64
+            lib-ext: dll
+            msvc-arch: amd64
+            pe-machine: x64
+          - os: windows-2022
+            platform: windows-arm64
+            lib-ext: dll
+            msvc-arch: amd64_arm64
+            pe-machine: ARM64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # --- Toolchain setup ------------------------------------------
+
+      - uses: Raku/setup-raku@v1
+        with:
+          raku-version: 'latest'
+
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: m-doughty/msvc-dev-cmd@v1-node24
+        with:
+          arch: ${{ matrix.msvc-arch }}
+
+      # Build.rakumod invokes `cc` and `strip` by name, so the cross
+      # toolchain is exposed under those names on PATH rather than by
+      # teaching the build a cross mode it would otherwise never use.
+      - name: Set up aarch64 cross toolchain (Linux)
+        if: matrix.cross == 'aarch64'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          mkdir -p "$HOME/xbin"
+          ln -sf "$(command -v aarch64-linux-gnu-gcc)"   "$HOME/xbin/cc"
+          ln -sf "$(command -v aarch64-linux-gnu-strip)" "$HOME/xbin/strip"
+          echo "$HOME/xbin" >> "$GITHUB_PATH"
+
+      # --- Build ----------------------------------------------------
+
+      # The same code path `zef install` takes: fetch the SOURCE_PINS
+      # tarballs, SHA-verify them, compile 17 TUs with per-TU includes,
+      # link, strip, stage into resources/lib/.
+      - name: Compile via Build.rakumod
+        shell: bash
+        env:
+          TREESITTER_NATIVE_BUILD_FROM_SOURCE: '1'
+        run: |
+          set -euxo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cache="$(cygpath -m "$RUNNER_TEMP")/ts-native-cache"
+          else
+            cache="$RUNNER_TEMP/ts-native-cache"
+          fi
+          export TREESITTER_NATIVE_CACHE_DIR="$cache"
+          raku -e 'require "$*CWD/Build.rakumod"; ::("Build").new.build($*CWD.Str);'
+          ls -l "resources/lib/libtreesitter-native.${{ matrix.lib-ext }}"
+
+      # --- Verify the artefact is for the architecture we claim -----
+
+      - name: Verify artefact (macOS)
+        if: matrix.platform == 'macos-universal'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          lib="resources/lib/libtreesitter-native.dylib"
+          lipo -info "$lib"
+          lipo -info "$lib" | grep -q 'arm64'
+          lipo -info "$lib" | grep -q 'x86_64'
+          otool -L "$lib"
+          nm -gU "$lib" | grep -q '_tsn_node_size'
+
+      - name: Verify artefact (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          lib="resources/lib/libtreesitter-native.so"
+          # readelf throughout, never nm: host binutils' nm is BFD-based
+          # and may refuse a cross-built aarch64 object, while readelf
+          # parses any ELF regardless of the host architecture.
+          readelf -h "$lib"
+          readelf -h "$lib" | grep -q '${{ matrix.elf-machine }}'
+          # No dependency beyond libc/libm/libpthread/libdl.
+          readelf -d "$lib" | grep NEEDED
+          readelf --dyn-syms "$lib" | grep -q ' tsn_node_size'
+
+      - name: Verify artefact (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          dumpbin /HEADERS resources\lib\libtreesitter-native.dll | findstr /C:"machine ("
+          dumpbin /HEADERS resources\lib\libtreesitter-native.dll | findstr /C:"machine (${{ matrix.pe-machine }})" || exit /b 1
+          dumpbin /EXPORTS resources\lib\libtreesitter-native.dll | findstr /C:"tsn_node_size" || exit /b 1
+
+      # --- Rename + stage artefact ---------------------------------
+
+      - name: Rename artefact to platform-specific filename
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p artefacts
+          src="resources/lib/libtreesitter-native.${{ matrix.lib-ext }}"
+          dst="artefacts/libtreesitter-native-${{ matrix.platform }}.${{ matrix.lib-ext }}"
+          cp "$src" "$dst"
+
+          # Emit the SHA256 alongside so the release job can collect
+          # them without re-hashing.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            shasum -a 256 "$dst" > "$dst.sha256"
+          else
+            sha256sum "$dst" > "$dst.sha256"
+          fi
+          cat "$dst.sha256"
+
+      - name: Upload artefact
+        uses: actions/upload-artifact@v6
+        with:
+          name: libtreesitter-native-${{ matrix.platform }}
+          path: artefacts/
+          retention-days: 14
+
+  # Aggregates all per-platform artefacts into a single GitHub release
+  # with a combined checksums.txt asset.
+  release:
+    name: release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/binaries-') || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all artefacts
+        uses: actions/download-artifact@v7
+        with:
+          path: downloaded/
+
+      - name: Flatten + generate combined checksums.txt + resolve tag
+        id: prep
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release
+          find downloaded -type f \( -name 'libtreesitter-native-*.dylib' \
+                                 -o -name 'libtreesitter-native-*.so'    \
+                                 -o -name 'libtreesitter-native-*.dll'   \) \
+            -exec cp {} release/ \;
+
+          cd release
+          # Format: `<sha256>  <filename>`, with BARE filenames —
+          # Build.rakumod matches the second column against the
+          # artefact basename, so `./*` would break every lookup.
+          # `--` keeps a hypothetical leading-dash name from becoming
+          # an option without touching the output.
+          sha256sum -- * | sort > ../checksums.txt
+          cd ..
+          echo "--- checksums.txt contents ---"
+          cat checksums.txt
+
+          # Source of truth: the BINARY_TAG file Build.rakumod also reads.
+          file_tag=$(cat BINARY_TAG | tr -d '[:space:]')
+          if [[ -z "$file_tag" ]]; then
+            echo "❌ BINARY_TAG file is empty or missing."
+            exit 1
+          fi
+
+          # On tag-push builds, refuse to release if the pushed tag
+          # doesn't match BINARY_TAG. That drift is a bug, not a
+          # release.
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            pushed=${GITHUB_REF#refs/tags/}
+            if [[ "$pushed" != "$file_tag" ]]; then
+              echo "❌ Pushed tag '$pushed' doesn't match BINARY_TAG file '$file_tag'."
+              echo "   Either update BINARY_TAG and commit, or push the matching tag."
+              exit 1
+            fi
+          fi
+
+          echo "tag=$file_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Create / update GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.prep.outputs.tag }}
+          name: ${{ steps.prep.outputs.tag }}
+          files: |
+            release/*
+            checksums.txt
+          body: |
+            Prebuilt `libtreesitter-native` binaries for `${{ steps.prep.outputs.tag }}`.
+
+            Each artefact is the tree-sitter 0.26.12 runtime plus the c,
+            cpp, python, javascript, typescript, tsx, go, rust and java
+            grammars, behind the `tsn_*` shim, with no dependencies
+            beyond libc. These are what `zef install TreeSitter::Native`
+            downloads by default. See `Build.rakumod` for the
+            install-time logic and env-var opt-outs, and `SOURCE_PINS`
+            for the exact upstream tags compiled in.
+
+            ## Verifying
+
+            ```
+            sha256sum -c checksums.txt
+            ```
+
+            ## Manual install (unusual)
+
+            If you need to pin a specific tag in an existing install:
+
+            ```
+            TREESITTER_NATIVE_BINARY_URL=https://github.com/${{ github.repository }}/releases/download \
+              zef install --force-build TreeSitter::Native
+            ```
+
+            ## After release
+
+            Copy `checksums.txt` contents into `resources/checksums.txt`
+            in the source tree + commit, then publish the next Raku
+            dist version. `Build.rakumod` treats the bundled checksums
+            as a hard security boundary and refuses prebuilts whose
+            SHA256 isn't recorded.
+          draft: false
+          prerelease: false

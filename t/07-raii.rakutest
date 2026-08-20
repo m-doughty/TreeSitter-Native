@@ -1,0 +1,224 @@
+use v6.d;
+use Test;
+use TreeSitter::Native;
+use TreeSitter::Native::Languages;
+use TreeSitter::Native::Query;
+
+# Lifetimes.
+#
+# Five things own C allocations — Parser, Tree, Cursor, Query and the
+# query cursor — and each has an idempotent .dispose plus a DESTROY that
+# calls it. What this file pins is the contract around that: disposing
+# twice is safe, disposing in the wrong order is safe, and using
+# something after disposing it throws instead of reading freed memory.
+
+# --- Parser -----------------------------------------------------------
+
+my $parser = Parser.new('python');
+nok $parser.disposed, 'a fresh parser is live';
+$parser.dispose;
+ok $parser.disposed, 'and disposed afterwards';
+lives-ok { $parser.dispose }, 'disposing twice is harmless';
+lives-ok { $parser.dispose for ^5 }, 'and so is disposing five times';
+
+throws-like { $parser.parse('x = 1') }, Exception,
+    message => /'already been disposed'/,
+    'parsing through a disposed parser throws';
+throws-like { $parser.set-language('go') }, Exception,
+    message => /'already been disposed'/,
+    'so does re-aiming it';
+throws-like { $parser.reset }, Exception,
+    message => /'already been disposed'/,
+    'so does resetting it';
+throws-like { $parser.language }, Exception,
+    message => /'already been disposed'/,
+    'and asking it for its grammar throws too';
+
+# --- A Tree outlives the Parser that made it --------------------------
+#
+# tree-sitter trees are independent allocations. This is the case a
+# consumer hits constantly: parse a file, drop the parser, keep the
+# tree.
+
+my $tree = do {
+    my $temp = Parser.new('python');
+    my $t = $temp.parse("def greet(name):\n    return name\n");
+    $temp.dispose;
+    $t;
+};
+
+nok $tree.disposed, 'the tree survives its parser';
+is $tree.root-node.type, 'module', 'and still answers questions';
+is $tree.root-node.named-child(0).child-by-field-name('name').text,
+   'greet',
+   'including ones that need its byte buffer';
+
+# --- A Node keeps its Tree alive --------------------------------------
+#
+# The Node holds a reference to the Tree, so ordinary garbage collection
+# can never free the tree out from under a live node. This is the same
+# scenario as above, one level further: keep only the node.
+
+my $node = do {
+    my $p = Parser.new('rust');
+    my $t = $p.parse(Q{fn greet() {}} ~ "\n");
+    my $n = $t.root-node.named-child(0);
+    $p.dispose;
+    $n;    # $t goes out of scope here; $n still references it
+};
+
+# Nudge the collector. Whether it actually runs is not something a test
+# can insist on, but if the Tree reference were missing this is where a
+# use-after-free would become likely.
+for ^3 { my @churn = (^20_000).map({ [$_, $_ + 1] }); @churn.elems }
+
+is $node.type, 'function_item',
+    'a node still works when only it is held';
+is $node.child-by-field-name('name').text, 'greet',
+    'and can still resolve its own text';
+nok $node.tree.disposed, 'because it kept its tree alive';
+
+# --- Explicit tree disposal is the one thing that breaks nodes --------
+
+my $doomed-parser = Parser.new('go');
+my $doomed = $doomed-parser.parse("package main\n");
+my $doomed-node = $doomed.root-node;
+
+nok $doomed-node.tree.disposed, 'the node reports a live tree';
+$doomed.dispose;
+ok $doomed.disposed, 'the tree is disposed';
+lives-ok { $doomed.dispose }, 'twice, harmlessly';
+
+throws-like { $doomed-node.type }, Exception,
+    message => /"node's tree has been disposed"/,
+    'and its nodes throw rather than reading freed memory';
+throws-like { $doomed-node.children }, Exception,
+    message => /"node's tree has been disposed"/,
+    'on navigation as well as identity';
+throws-like { $doomed-node.text }, Exception,
+    message => /"node's tree has been disposed"/,
+    'and on text';
+throws-like { $doomed.root-node }, Exception,
+    message => /'already been disposed'/,
+    'the tree itself refuses to hand out more nodes';
+
+# .gist stays safe, because a debugger printing a stale object should
+# not be the thing that throws.
+lives-ok { $doomed-node.gist }, 'gist survives a disposed tree';
+ok $doomed-node.gist.contains('disposed'), 'and says so';
+lives-ok { $doomed.gist }, 'and so does the tree gist';
+
+$doomed-parser.dispose;
+
+# --- Cursor -----------------------------------------------------------
+
+my $walk-parser = Parser.new('python');
+my $walk-tree   = $walk-parser.parse("x = 1\ny = 2\n");
+my $cursor      = $walk-tree.cursor;
+
+nok $cursor.disposed, 'a fresh cursor is live';
+is $cursor.current-node.type, 'module', 'and starts on the root';
+$cursor.dispose;
+ok $cursor.disposed, 'disposing takes';
+lives-ok { $cursor.dispose }, 'twice, harmlessly';
+throws-like { $cursor.current-node }, Exception,
+    message => /'already been disposed'/,
+    'and using it afterwards throws';
+
+# A cursor over a disposed tree refuses too, whichever order they were
+# disposed in.
+my $orphan-cursor = $walk-tree.cursor;
+$walk-tree.dispose;
+throws-like { $orphan-cursor.goto-first-child }, Exception,
+    message => /'tree has been disposed'/,
+    'a cursor will not walk a disposed tree';
+lives-ok { $orphan-cursor.dispose },
+    'though it can still be disposed itself';
+
+# --- Query ------------------------------------------------------------
+
+my $qparser = Parser.new('python');
+my $qtree   = $qparser.parse("def f():\n    return g()\n");
+my $query   = Query.new('python', tags-query('python'));
+
+nok $query.disposed, 'a fresh query is live';
+ok $query.matches($qtree.root-node).elems, 'and matches things';
+
+# The Seq from .matches disposes its cursor when it is exhausted, so
+# running it repeatedly must not leak or fail.
+for ^25 {
+    $query.matches($qtree.root-node).eager;
+}
+pass 'repeated full iterations neither leak a cursor nor fail';
+
+# Abandoning a partly-consumed Seq is safe: the cursor is left to the
+# collector rather than freed promptly, which is documented.
+for ^25 {
+    $query.matches($qtree.root-node).head;
+}
+pass 'repeated partial iterations are safe';
+
+# A hand-driven cursor, disposed explicitly.
+my $qcursor = $query.cursor($qtree.root-node);
+nok $qcursor.disposed, 'a query cursor starts live';
+my $count = 0;
+while $qcursor.next-match -> $m { $count++ }
+ok $count > 0, 'it yields matches';
+is $qcursor.next-match, TreeSitter::Native::Query::Match,
+    'and then keeps returning the type object';
+$qcursor.dispose;
+ok $qcursor.disposed, 'disposing takes';
+lives-ok { $qcursor.dispose }, 'twice, harmlessly';
+throws-like { $qcursor.next-match }, Exception,
+    message => /'already been disposed'/,
+    'and it refuses to run afterwards';
+
+# Matches outlive the cursor that produced them: their captures were
+# copied out of tree-sitter's capture array, which the next call to
+# next_match invalidates.
+my @kept = $query.matches($qtree.root-node).eager;
+ok @kept.elems, 'matches were collected';
+ok @kept.head.captures<name>.defined,
+    'and their captures still resolve after the iteration ended';
+is @kept.head.captures<name>.text.chars > 0, True,
+    'including their text';
+
+$query.dispose;
+ok $query.disposed, 'the query is disposed';
+lives-ok { $query.dispose }, 'twice, harmlessly';
+throws-like { $query.pattern-count }, Exception,
+    message => /'already been disposed'/,
+    'and introspecting it afterwards throws';
+throws-like { $query.matches($qtree.root-node) }, Exception,
+    message => /'already been disposed'/,
+    'as does running it';
+
+# A query cursor over a disposed tree refuses.
+my $q2 = Query.new('python', '(identifier) @id');
+my $c2 = $q2.cursor($qtree.root-node);
+$qtree.dispose;
+throws-like { $c2.next-match }, Exception,
+    message => /'has been disposed'/,
+    'a query cursor will not run over a disposed tree';
+lives-ok { $c2.dispose }, 'but disposes cleanly';
+$q2.dispose;
+$qparser.dispose;
+$walk-parser.dispose;
+
+# --- Disposal order does not matter -----------------------------------
+#
+# Whatever order a consumer's scopes unwind in, nothing double-frees.
+
+for (<parser tree query cursor>, <cursor query tree parser>,
+     <tree parser cursor query>) -> @order {
+    my %o;
+    %o<parser> = Parser.new('javascript');
+    %o<tree>   = %o<parser>.parse(Q{function f() { return 1; }} ~ "\n");
+    %o<query>  = Query.new('javascript', '(identifier) @id');
+    %o<cursor> = %o<tree>.cursor;
+    %o<query>.matches(%o<tree>.root-node).eager;
+    lives-ok { %o{$_}.dispose for @order },
+        "disposing in the order {@order.join(', ')} is safe";
+}
+
+done-testing;

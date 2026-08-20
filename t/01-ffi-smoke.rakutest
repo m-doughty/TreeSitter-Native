@@ -1,0 +1,145 @@
+use v6.d;
+use Test;
+use NativeCall;
+use TreeSitter::Native::FFI;
+
+# The raw binding layer, exercised without any of the ergonomics on top
+# of it. If this file passes and everything else fails, the bug is in
+# Raku code; if this file fails, the bug is in the library, the shim or
+# a signature.
+
+plan 56;
+
+# --- Meta ------------------------------------------------------------
+
+is tsn_shim_abi_version(), 1,
+    'the shim reports contract version 1';
+
+# 32 bytes: four uint32 of context plus two pointers. The load-time
+# assertion in FFI.rakumod already checked this — re-checking it here
+# makes the failure legible rather than a bare "cannot load".
+is tsn_node_size(), 32, 'sizeof(TSNode) is 32 bytes';
+is nativesizeof(TSNodeBuf), 32, 'TSNodeBuf is 32 bytes';
+is tsn_node_size(), nativesizeof(TSNodeBuf),
+    'the buffer we allocate is the size the library expects';
+
+my Int $runtime = tsn_runtime_abi_version().Int;
+my Int $floor   = tsn_min_compatible_abi().Int;
+is $runtime, 15, 'the bundled runtime implements language ABI 15';
+is $floor,   13, 'and still accepts grammars as old as ABI 13';
+ok $floor <= $runtime, 'the accepted ABI range is not inside out';
+
+ok  tsn_language_abi_supported($runtime), 'the ceiling ABI is supported';
+ok  tsn_language_abi_supported($floor),   'the floor ABI is supported';
+ok  tsn_language_abi_supported(14),
+    'ABI 14 is supported (cpp, java, typescript and tsx sit there)';
+nok tsn_language_abi_supported($floor - 1),
+    'one below the floor is refused';
+nok tsn_language_abi_supported($runtime + 1),
+    'one above the ceiling is refused';
+
+# --- Bundled grammars ------------------------------------------------
+
+my %getters =
+    c          => &tsn_lang_c,
+    cpp        => &tsn_lang_cpp,
+    python     => &tsn_lang_python,
+    javascript => &tsn_lang_javascript,
+    typescript => &tsn_lang_typescript,
+    tsx        => &tsn_lang_tsx,
+    go         => &tsn_lang_go,
+    rust       => &tsn_lang_rust,
+    java       => &tsn_lang_java,
+;
+
+for %getters.keys.sort -> Str $name {
+    my TSLanguage $lang = %getters{$name}();
+    ok $lang.defined, "tsn_lang_$name returns a grammar";
+}
+
+for %getters.keys.sort -> Str $name {
+    my Int $abi = tsn_language_abi(%getters{$name}()).Int;
+    ok tsn_language_abi_supported($abi),
+        "the $name grammar's ABI ($abi) is within the runtime's range";
+}
+
+# tsx and typescript are two grammars, not one grammar under two names.
+# CPointer classes carry no numeric coercion of their own, so ask
+# NativeCall for the address.
+isnt nativecast(Pointer, tsn_lang_tsx()).Int,
+     nativecast(Pointer, tsn_lang_typescript()).Int,
+     'tsx and typescript are distinct grammars';
+
+# Language introspection, on a grammar big enough to be interesting.
+my TSLanguage $py = tsn_lang_python();
+ok tsn_language_symbol_count($py) > 100,
+    'python has a substantial symbol table';
+ok tsn_language_field_count($py) > 5, 'python declares fields';
+is tsn_language_symbol_name($py, 0), 'end',
+    'symbol 0 is the end-of-input symbol';
+nok tsn_language_symbol_name($py, 65535).defined,
+    'an out-of-range symbol id yields no name, rather than trapping';
+nok tsn_language_field_name_for_id($py, 0).defined,
+    'field id 0 is the "no field" sentinel';
+ok tsn_language_field_name_for_id($py, 1).defined,
+    'field id 1 names a field';
+
+# --- A parse, end to end, through the raw layer -----------------------
+
+my TSParser $parser = tsn_parser_new();
+ok $parser.defined, 'tsn_parser_new allocates a parser';
+is tsn_parser_set_language($parser, $py), 1, 'the grammar is accepted';
+
+my Blob $src = "x = 1\n".encode('utf-8');
+my TSTree $tree =
+    tsn_parser_parse_utf8($parser, TSTree, $src, $src.elems);
+ok $tree.defined, 'a Blob crosses the boundary and produces a tree';
+
+my TSNodeBuf $root .= new;
+tsn_tree_root_node($tree, $root);
+is tsn_node_type($root), 'module', 'the root node is a module';
+is tsn_node_start_byte($root), 0, 'the root starts at byte 0';
+is tsn_node_end_byte($root), $src.elems, 'and ends at the last byte';
+is tsn_node_is_null($root), 0, 'the root is not the null node';
+is tsn_node_child_count($root), 1, 'the root has one child';
+
+my uint32 ($row, $col);
+tsn_node_end_point($root, $row, $col);
+is $row, 1, 'the end point row comes back through the out-param';
+is $col, 0, 'the end point column comes back through the out-param';
+
+is tsn-owned-str(tsn_node_string($root)),
+   '(module (expression_statement (assignment left: (identifier) right: (integer))))',
+   'the malloc\'d S-expression decodes (and is freed)';
+
+# The null node: every accessor degrades instead of dereferencing it.
+my TSNodeBuf $null .= new;
+is  tsn_node_is_null($null), 1,  'a zeroed buffer is the null node';
+nok tsn_node_type($null).defined, 'the null node has no type';
+is  tsn_node_start_byte($null), 0, 'the null node reports offset 0';
+is  tsn_node_child_count($null), 0, 'and no children';
+
+# --- A query, on an ABI-14 grammar ------------------------------------
+#
+# java is ABI 14 while the runtime is 15. Query compilation is where an
+# ABI mismatch would show up first, so compile one against java
+# specifically.
+my uint32 ($error-offset, $error-type);
+my TSQuery $query = do {
+    my Blob $q = '(method_declaration name: (identifier) @name)'.encode('utf-8');
+    tsn_query_new(tsn_lang_java(), $q, $q.elems,
+                  $error-offset, $error-type);
+};
+ok $query.defined, 'a query compiles against the ABI-14 java grammar';
+is tsn_query_pattern_count($query), 1, 'it has one pattern';
+is tsn_query_capture_count($query), 1, 'and one capture';
+
+my uint32 $len;
+is tsn-borrowed-str(
+       tsn_query_capture_name_for_id($query, 0, $len), $len.Int),
+   'name',
+   'the capture name comes back with its explicit length';
+
+tsn_query_delete($query);
+tsn_tree_delete($tree);
+tsn_parser_delete($parser);

@@ -1,0 +1,25 @@
+# TreeSitter::Native prebuilt binary checksums.
+#
+# DO NOT hand-edit entries. After a binary release is published, CI
+# produces a checksums.txt as a release asset; copy its contents here:
+#
+#     gh release download "$(cat BINARY_TAG)" \
+#         --pattern checksums.txt --output /tmp/new.txt
+#     cp /tmp/new.txt resources/checksums.txt
+#     git add resources/checksums.txt
+#     git commit -m "Update binary checksums for $(cat BINARY_TAG)"
+#
+# Format: one entry per line
+#     <sha256-hex>  <artefact-filename>
+#
+# Lines starting with '#' and blank lines are ignored. When this file
+# is empty or doesn't list the expected artefact, every prebuilt
+# lookup fails SHA verify and Build.rakumod falls back to compiling
+# from source — safe default, just slower (and, here, meaningfully
+# slower: the source path fetches nine tarballs and compiles 17
+# translation units).
+#
+# This file is intentionally entry-less in the 0.1.0 tree: no binary
+# release has been cut yet, so every install compiles from source. The
+# first entries land when the binaries-treesitter-native-0.1.0-r1 tag
+# named in BINARY_TAG is published.

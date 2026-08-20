@@ -1,0 +1,43 @@
+# Line-ending pins.
+#
+# Everything here is parsed line-by-line by Build.rakumod, by CI shell
+# scripts, or by both. A Windows checkout with core.autocrlf=true would
+# hand those parsers a trailing \r on every line, which breaks the
+# fixed-width hex checks (a 64-char SHA-256 becomes 65 chars) and turns
+# a URL into a URL-plus-carriage-return that curl cannot resolve.
+
+# SOURCE_PINS carries nine 64-char SHA-256 digests and nine URLs;
+# BINARY_TAG is compared verbatim against a git tag name.
+SOURCE_PINS       text eol=lf
+BINARY_TAG        text eol=lf
+
+# resources/checksums.txt is the prebuilt-download security boundary and
+# is parsed the same way. Other .txt files ship verbatim inside binary
+# packs, so pinning them keeps the bytes — and therefore the digests —
+# identical no matter which runner produced the archive.
+*.txt             text eol=lf
+
+# Shell scripts: bash and msys2 bash both misbehave on CRLF-tainted
+# scripts. YAML is whitespace-significant and read by the same lanes.
+*.sh              text eol=lf
+*.yml             text eol=lf
+*.yaml            text eol=lf
+
+# The shim sources are compiled on every platform and their bytes end
+# up in reproducibility comparisons between lanes; keep them LF so a
+# Windows checkout compiles the same file a Linux checkout does.
+*.c               text eol=lf
+*.h               text eol=lf
+src/exports.def   text eol=lf
+
+# Vendored upstream query files are matched byte-for-byte against
+# upstream by xt/01-queries-upstream.rakutest, and their content (regex
+# predicates, string literals) is fed to the tree-sitter query parser
+# as-is.
+*.scm             text eol=lf
+
+# The vendored upstream licences are compared byte-for-byte by the same
+# test and have no extension for the rules above to match on, so pin
+# the directory. A CRLF-converting checkout would otherwise fail that
+# comparison on Windows while the file still LOOKED identical.
+resources/licenses/* text eol=lf

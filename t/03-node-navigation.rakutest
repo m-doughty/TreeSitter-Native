@@ -1,0 +1,256 @@
+use v6.d;
+use Test;
+use TreeSitter::Native;
+use TreeSitter::Native::Languages;
+
+# Node navigation, exercised once per bundled grammar so that a broken
+# parser TU shows up here rather than in whatever consumer notices it
+# first. Fixtures are deliberately tiny and deliberately inline: they
+# have to survive being read as documentation.
+#
+# Note the q:to/SRC/ heredocs. These fixtures are full of braces, and a
+# double-quoted Raku string would treat `{ int x; }` as an interpolated
+# code block.
+
+my @cases =
+    %(
+        lang     => 'c',
+        source   => q:to/SRC/,
+            int add(int a, int b) { return a + b; }
+            SRC
+        root     => 'translation_unit',
+        first    => 'function_definition',
+        # The C grammar buries the name one level down, under the
+        # function declarator.
+        name     => -> $def { $def.child-by-field-name('declarator')
+                                  .child-by-field-name('declarator') },
+        expected => 'add',
+    ),
+    %(
+        lang     => 'cpp',
+        source   => q:to/SRC/,
+            struct Point { int x; };
+            SRC
+        root     => 'translation_unit',
+        first    => 'struct_specifier',
+        name     => -> $def { $def.child-by-field-name('name') },
+        expected => 'Point',
+    ),
+    %(
+        lang     => 'python',
+        source   => q:to/SRC/,
+            def greet(name):
+                return name
+            SRC
+        root     => 'module',
+        first    => 'function_definition',
+        name     => -> $def { $def.child-by-field-name('name') },
+        expected => 'greet',
+    ),
+    %(
+        lang     => 'javascript',
+        source   => q:to/SRC/,
+            function greet(name) { return name; }
+            SRC
+        root     => 'program',
+        first    => 'function_declaration',
+        name     => -> $def { $def.child-by-field-name('name') },
+        expected => 'greet',
+    ),
+    %(
+        lang     => 'typescript',
+        source   => q:to/SRC/,
+            function greet(name: string): string { return name; }
+            SRC
+        root     => 'program',
+        first    => 'function_declaration',
+        name     => -> $def { $def.child-by-field-name('name') },
+        expected => 'greet',
+    ),
+    %(
+        lang     => 'tsx',
+        source   => q:to/SRC/,
+            const App = () => <div className="x" />;
+            SRC
+        root     => 'program',
+        first    => 'lexical_declaration',
+        name     => -> $def { $def.named-child(0)
+                                  .child-by-field-name('name') },
+        expected => 'App',
+    ),
+    %(
+        lang     => 'go',
+        source   => q:to/SRC/,
+            package main
+
+            func greet(name string) string { return name }
+            SRC
+        root     => 'source_file',
+        first    => 'package_clause',
+        name     => -> $def { $def.named-child(0) },
+        expected => 'main',
+    ),
+    %(
+        lang     => 'rust',
+        source   => q:to/SRC/,
+            fn greet(name: &str) -> &str { name }
+            SRC
+        root     => 'source_file',
+        first    => 'function_item',
+        name     => -> $def { $def.child-by-field-name('name') },
+        expected => 'greet',
+    ),
+    %(
+        lang     => 'java',
+        source   => q:to/SRC/,
+            class Greeter { String greet(String name) { return name; } }
+            SRC
+        root     => 'program',
+        first    => 'class_declaration',
+        name     => -> $def { $def.child-by-field-name('name') },
+        expected => 'Greeter',
+    ),
+;
+
+is @cases.map(*<lang>).sort.List, languages(),
+    'every bundled grammar has a navigation fixture';
+
+for @cases -> %case {
+    my Str $lang = %case<lang>;
+    subtest "$lang" => {
+        my $parser = Parser.new($lang);
+        my $tree   = $parser.parse(%case<source>);
+        my $root   = $tree.root-node;
+
+        is $root.type, %case<root>, 'root node type';
+        nok $root.has-error, 'fixture parses without errors';
+        ok $root.sexp.starts-with('(' ~ %case<root>),
+            'the S-expression agrees about the root';
+
+        my $first = $root.named-child(0);
+        ok $first.defined, 'the root has a first named child';
+        is $first.type, %case<first>, 'of the expected type';
+        ok $first.is-named, 'which is a named node';
+
+        my $name = %case<name>($first);
+        ok $name.defined, 'the known child path resolves';
+        is $name.text, %case<expected>, 'and holds the expected text';
+
+        # The name node's byte range really does bracket its text.
+        is $name.byte-length, %case<expected>.encode('utf-8').elems,
+            'its byte length matches its text';
+
+        # Walking back up gets us where we started.
+        ok $name.parent.defined, 'the name node has a parent';
+        ok $root.walk.first({ $_ === $name }).defined,
+            'and the name node is reachable from the root by walking';
+
+        $tree.dispose;
+        $parser.dispose;
+    };
+}
+
+# --- The navigation surface, in detail, on one tree -------------------
+
+my $parser = Parser.new('python');
+my $tree   = $parser.parse(q:to/SRC/);
+    def greet(name):
+        return name
+    SRC
+my $root = $tree.root-node;
+my $def  = $root.named-child(0);
+
+# Counts, and named-vs-all.
+is $root.child-count, 1, 'the module has one child';
+is $root.named-child-count, 1, 'and one named child';
+ok $def.child-count > $def.named-child-count,
+    'the definition has anonymous children too (def, :)';
+is $def.children.elems, $def.child-count, 'children agrees with the count';
+is $def.named-children.elems, $def.named-child-count,
+    'named-children agrees with the named count';
+ok $def.children.grep({ !.is-named }).elems,
+    'and the anonymous ones show up in children';
+
+# Absent nodes are undefined Nodes, not null Nodes: `with` works.
+nok $root.parent.defined, 'the root has no parent';
+nok $root.next-sibling.defined, 'nor a next sibling';
+nok $root.prev-sibling.defined, 'nor a previous one';
+nok $def.child(999).defined, 'an out-of-range child index is undefined';
+nok $def.child(-1).defined, 'as is a negative one';
+nok $def.named-child(999).defined,
+    'an out-of-range named child index is undefined';
+nok $def.child-by-field-name('no_such_field').defined,
+    'an unknown field name is undefined';
+nok $def.child-by-field-name('').defined,
+    'as is the empty field name';
+
+# Siblings, forwards and back.
+my $name   = $def.child-by-field-name('name');
+my $params = $def.child-by-field-name('parameters');
+is $name.next-named-sibling.type, $params.type,
+    'next-named-sibling skips the anonymous nodes';
+ok $name.next-sibling.defined, 'next-sibling does not';
+is $params.prev-named-sibling.text, 'greet',
+    'and prev-named-sibling comes back';
+
+# Fields.
+is $def.field-name-for-child(0), Str,
+    'the `def` keyword occupies no field';
+is $def.field-name-for-child(1), 'name', 'the identifier occupies name';
+is $def.field-name-for-child(999), Str,
+    'an out-of-range child has no field name';
+is $def.field-name-for-child(-1), Str, 'nor does a negative index';
+
+# Positions.
+is $name.start-point.row, 0, 'the name is on row 0';
+is $name.start-point.column, 4, 'at byte column 4';
+is $name.start-point.Str, '0:4', 'and stringifies as row:column';
+is $def.end-point.row, 1, 'the definition ends on row 1';
+
+# Identity: two handles on the same node are the same value.
+ok $root.named-child(0) === $def, 'nodes are value objects';
+ok $root.named-child(0).equals($def), 'and .equals agrees';
+nok $def.equals($name), 'different nodes are not equal';
+nok $def.equals(Node), 'and comparing against nothing is False';
+is ($root.walk.Set).elems, $root.walk.elems,
+    'every node in a walk is distinct';
+
+# Descendants by byte range.
+my $found = $root.descendant-for-byte-range(
+    $name.start-byte, $name.end-byte);
+is $found.text, 'greet', 'descendant-for-byte-range finds the name';
+is $root.named-descendant-for-byte-range(
+       $name.start-byte, $name.end-byte).text,
+   'greet', 'and so does the named variant';
+
+# Types and symbols.
+ok $def.symbol > 0, 'a named node has a non-zero symbol id';
+is $def.grammar-type, $def.type,
+    'grammar-type matches type outside a supertype';
+ok $root.gist.contains('module'), 'gist names the node type';
+
+# .gist, .Str and .raku have to survive being called on a TYPE object.
+# Navigation returns undefined Nodes routinely, so `say $node.parent`
+# on a root is ordinary code — and Raku's own Pod renderer calls .raku
+# on every declared type, which is how a careless override takes
+# `mi6 build` down with it.
+lives-ok { Node.gist },  'Node.gist on the type object is safe';
+# `quietly` because Mu's own :U candidate warns about stringifying an
+# undefined value — which is the right behaviour, and is exactly what
+# we want left in place rather than overridden away.
+lives-ok { quietly Node.Str },
+    'Node.Str on the type object warns rather than dying';
+lives-ok { Node.raku },  'Node.raku on the type object is safe';
+lives-ok { $root.parent.gist },
+    'and so is gist on an absent navigation result';
+lives-ok { Tree.gist },  'Tree.gist on the type object is safe';
+lives-ok { TreeSitter::Native::Cursor.gist },
+    'Cursor.gist on the type object is safe';
+lives-ok { TreeSitter::Native::Point.gist },
+    'Point.gist on the type object is safe';
+lives-ok { TreeSitter::Native::Point.raku },
+    'Point.raku on the type object is safe';
+is $def.start-point.gist, $def.start-point.Str,
+    'while a defined Point still stringifies its own way';
+
+done-testing;

@@ -1,0 +1,153 @@
+use v6.d;
+use Test;
+use TreeSitter::Native;
+
+# The byte doctrine, pinned.
+#
+# Every offset this distribution reports is a byte offset into the
+# UTF-8 encoding of the source. Raku strings are sequences of graphemes,
+# and the two disagree in both of the ways that bite real code: a
+# multibyte character makes bytes outnumber characters, and a CRLF pair
+# is ONE grapheme but TWO bytes. Both are checked here against
+# hand-computed byte counts, so a regression cannot hide behind an
+# accessor that agrees with itself.
+
+my $parser = Parser.new('python');
+
+# --- Multibyte identifiers -------------------------------------------
+
+# 'größe' is 5 characters and 7 bytes: ö and ß are two bytes each.
+my Str $name   = 'größe';
+my Str $prefix = 'def ';
+# Concatenated rather than interpolated: "$name(wert)" would parse as
+# a call on $name, not as the identifier followed by a parenthesis.
+my Str $source = $prefix ~ $name ~ "(wert):\n    return wert\n";
+
+is $name.chars, 5, 'größe is five characters';
+is $name.encode('utf-8').elems, 7, 'and seven bytes';
+
+my $tree = $parser.parse($source);
+is $tree.bytes.elems, $source.encode('utf-8').elems,
+    'the tree holds the encoded byte count';
+isnt $tree.bytes.elems, $source.chars,
+    'which is not the character count';
+
+my $def = $tree.root-node.named-child(0);
+my $id  = $def.child-by-field-name('name');
+
+is $id.text, $name, 'the identifier decodes back to itself';
+is $id.start-byte, $prefix.encode('utf-8').elems,
+    'its start byte is the byte length of everything before it';
+is $id.end-byte, ($prefix ~ $name).encode('utf-8').elems,
+    'and its end byte is the byte length up to and including it';
+is $id.byte-length, 7, 'so its byte length is 7, not 5';
+is $id.text.chars, 5, 'while its text is still 5 characters';
+
+# The whole point: character arithmetic on the source gives the WRONG
+# answer for exactly these offsets.
+isnt $source.substr($id.start-byte,
+                    $id.end-byte - $id.start-byte),
+     $name,
+     'substr with byte offsets does not reproduce the identifier';
+is $tree.bytes.subbuf($id.start-byte,
+                      $id.end-byte - $id.start-byte).decode('utf-8'),
+   $name,
+   'but slicing the byte buffer does';
+is $id.byte-slice.decode('utf-8'), $id.text,
+    'and byte-slice is that slice';
+
+# Point columns are byte columns too.
+is $id.start-point.row, 0, 'the identifier is on row 0';
+is $id.start-point.column, 4, 'starting at byte column 4';
+is $id.end-point.column, 11,
+    'and ending at byte column 11, not character column 9';
+
+# --- Non-ASCII inside a string literal -------------------------------
+
+my Str $snow = "s = '☃ снеговик'\n";
+my $stree = $parser.parse($snow);
+my $str = $stree.root-node.named-child(0).named-child(0)
+                .child-by-field-name('right');
+
+is $str.text, "'☃ снеговик'", 'a multibyte string literal round-trips';
+is $str.byte-length, "'☃ снеговик'".encode('utf-8').elems,
+    'with a byte length matching its encoding';
+ok $str.byte-length > $str.text.chars,
+    'which is larger than its character count';
+
+# Every node in the tree round-trips through its own byte range.
+for $stree.root-node.walk -> $node {
+    my $slice = $stree.bytes.subbuf(
+        $node.start-byte, $node.end-byte - $node.start-byte);
+    if $slice.decode('utf-8') ne $node.text {
+        flunk "node {$node.gist} does not round-trip";
+        last;
+    }
+}
+pass 'every node in a multibyte tree round-trips through its bytes';
+
+# --- CRLF ------------------------------------------------------------
+#
+# The trap this distribution's byte doctrine exists for: "\r\n" is one
+# Raku grapheme and two bytes, so a Windows-line-ended file's character
+# offsets drift one further behind its byte offsets on every line.
+
+my Str $crlf = "x = 1\r\ny = 2\r\n";
+is "\r\n".chars, 1, 'CRLF is ONE grapheme in Raku';
+is "\r\n".encode('utf-8').elems, 2, 'and TWO bytes';
+is $crlf.chars, 12, 'the CRLF fixture is 12 characters';
+is $crlf.encode('utf-8').elems, 14, 'and 14 bytes';
+
+my $ctree = $parser.parse($crlf);
+is $ctree.bytes.elems, 14, 'the tree holds all 14 bytes';
+
+my $first  = $ctree.root-node.named-child(0);
+my $second = $ctree.root-node.named-child(1);
+
+is $first.text, 'x = 1', 'the first statement decodes';
+is $second.text, 'y = 2', 'and so does the second';
+
+is $second.start-byte, 7,
+    'the second statement starts at byte 7 (after "x = 1\r\n")';
+isnt $second.start-byte, "x = 1\r\n".chars,
+    'which is NOT the character offset of the same position';
+is "x = 1\r\n".chars, 6, 'because that offset is 6';
+
+is $second.start-point.row, 1, 'it is on row 1';
+is $second.start-point.column, 0, 'at column 0';
+
+is $second.byte-slice.decode('utf-8'), $second.text,
+    'and its byte slice still round-trips';
+
+# A statement in the middle of a longer CRLF file lands where byte
+# arithmetic says it should, not where character arithmetic does.
+my Str $long = (1..5).map({ "v$_ = $_" }).join("\r\n") ~ "\r\n";
+my $ltree = $parser.parse($long);
+my $third = $ltree.root-node.named-child(2);
+is $third.text, 'v3 = 3', 'the third statement of a CRLF file';
+is $third.start-byte, "v1 = 1\r\nv2 = 2\r\n".encode('utf-8').elems,
+    'starts at the byte offset its predecessors occupy';
+is $third.start-point.row, 2, 'on row 2';
+
+# --- Both at once ----------------------------------------------------
+
+my Str $mixed = "ä = 1\r\nβ = 2\r\n";
+my $mtree = $parser.parse($mixed);
+my $second-name = $mtree.root-node.named-child(1)
+                        .named-child(0).child-by-field-name('left');
+is $second-name.text, 'β', 'a multibyte identifier after a CRLF line';
+is $second-name.start-byte, "ä = 1\r\n".encode('utf-8').elems,
+    'starts where the encoded prefix ends';
+is $second-name.byte-length, 2, 'and is two bytes long';
+is $second-name.text.chars, 1, 'though only one character';
+
+# --- parse-bytes agrees with parse -----------------------------------
+
+my $btree = $parser.parse-bytes($source.encode('utf-8'));
+is $btree.root-node.sexp, $tree.root-node.sexp,
+    'parse-bytes and parse produce the same tree for the same bytes';
+is $btree.root-node.named-child(0).child-by-field-name('name').text,
+   $name,
+   'and node text decodes identically';
+
+done-testing;

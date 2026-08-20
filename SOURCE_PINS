@@ -1,0 +1,46 @@
+# SOURCE_PINS — upstream C sources compiled into libtreesitter-native.
+#
+# Build.rakumod reads this file whenever it takes the source-compile
+# path (no prebuilt available, or TREESITTER_NATIVE_BUILD_FROM_SOURCE=1).
+# Each row names one GitHub tag-archive tarball to download, verify, and
+# extract into the source cache.
+#
+# Format: four whitespace-separated columns, one row per upstream.
+#
+#     <name>  <tag>  <sha256-of-tarball>  <url>
+#
+# `#` comments and blank lines are ignored. `name` doubles as the cache
+# subdirectory stem (`<cache>/TreeSitter-Native-source/<name>-<tag>/`)
+# and as the key Build.rakumod uses to look each tree up, so it must be
+# unique and must not contain whitespace or path separators.
+#
+# Why tarballs and not `git fetch <sha>`: a source install would
+# otherwise need git plus nine shallow clones of repositories whose
+# history dwarfs the tree we actually want. The trade-off is that
+# GitHub's tag archives are not byte-stable in principle (the gzip
+# framing can change when GitHub upgrades its archiver, even though the
+# underlying tree is immutable). We fail closed: a digest that no longer
+# matches aborts the build rather than compiling unverified code. If
+# that ever happens the recovery is either
+#
+#     TREESITTER_NATIVE_VENDOR_DIR=/path/to/pre-staged/sources
+#
+# (a directory laid out exactly like the cache — one `<name>-<tag>/`
+# subdirectory per row, each holding that upstream's repository root),
+# or re-pinning: download the tarball, re-hash it, and update the row.
+# Re-pinning is a source change, so it also wants a BINARY_TAG bump.
+#
+# ABI note: the runtime is tree-sitter 0.26.x, which implements language
+# ABI 15 and accepts anything down to 13. tree-sitter-cpp, -java and
+# -typescript are still generated at ABI 14 — compatible, deliberately
+# pinned, and covered by the smoke tests.
+
+tree-sitter             v0.26.12  428e2b182fe38eddc100d8bd851e47c96921a69281b66abafc25ba4b0aaeeeab  https://github.com/tree-sitter/tree-sitter/archive/refs/tags/v0.26.12.tar.gz
+tree-sitter-c           v0.24.2   2eeb4db31f8fa0865e45488503d13403923bcb485a1bdb637abff8c42dd97364  https://github.com/tree-sitter/tree-sitter-c/archive/refs/tags/v0.24.2.tar.gz
+tree-sitter-cpp         v0.23.4   7a2c55afe3028f4105f25762ea58cc16537d1f5a1dcd9cca90410b3cd5d46051  https://github.com/tree-sitter/tree-sitter-cpp/archive/refs/tags/v0.23.4.tar.gz
+tree-sitter-python      v0.25.0   4609a3665a620e117acf795ff01b9e965880f81745f287a16336f4ca86cf270c  https://github.com/tree-sitter/tree-sitter-python/archive/refs/tags/v0.25.0.tar.gz
+tree-sitter-javascript  v0.25.0   9712fc283d3dc01d996d20b6392143445d05867a7aad76fdd723824468428b86  https://github.com/tree-sitter/tree-sitter-javascript/archive/refs/tags/v0.25.0.tar.gz
+tree-sitter-typescript  v0.23.2   2c4ce711ae8d1218a3b2f899189298159d672870b5b34dff5d937bed2f3e8983  https://github.com/tree-sitter/tree-sitter-typescript/archive/refs/tags/v0.23.2.tar.gz
+tree-sitter-go          v0.25.0   2dc241b97872c53195e01b86542b411a3c1a6201d9c946c78d5c60c063bba1ef  https://github.com/tree-sitter/tree-sitter-go/archive/refs/tags/v0.25.0.tar.gz
+tree-sitter-rust        v0.24.2   061e90a539a55a6aa65dceb0ad6425c50ab1a6e3e6d4ba430e2795ed4550f10e  https://github.com/tree-sitter/tree-sitter-rust/archive/refs/tags/v0.24.2.tar.gz
+tree-sitter-java        v0.23.5   cb199e0faae4b2c08425f88cbb51c1a9319612e7b96315a174a624db9bf3d9f0  https://github.com/tree-sitter/tree-sitter-java/archive/refs/tags/v0.23.5.tar.gz

@@ -1,0 +1,132 @@
+; exports.def — the authoritative export list for libtreesitter-native.dll.
+;
+; Handed to `link /DLL /DEF:src\exports.def`. Every symbol Raku binds
+; must appear here; the TSN_EXPORT macro in ts_shim.h supplies the
+; matching __declspec(dllexport) at each definition, and the two lists
+; must stay in step.
+;
+; Note that the DLL's export table will be slightly larger than this
+; file: each generated grammar's parser.c declares its entry point
+; TS_PUBLIC, which expands to __declspec(dllexport) on Windows, so
+; tree_sitter_c and friends also land in the table. That is benign —
+; the bindings never look them up, and the .def file is what keeps the
+; tree-sitter runtime's own ts_* surface out of it.
+;
+; No LIBRARY line on purpose: it would override the /OUT: name the
+; build passes, and the artefact name differs between the source path
+; and the CI prebuilt lane.
+
+EXPORTS
+    ; Meta
+    tsn_shim_abi_version
+    tsn_node_size
+    tsn_runtime_abi_version
+    tsn_min_compatible_abi
+    tsn_language_abi_supported
+
+    ; Bundled languages
+    tsn_lang_c
+    tsn_lang_cpp
+    tsn_lang_python
+    tsn_lang_javascript
+    tsn_lang_typescript
+    tsn_lang_tsx
+    tsn_lang_go
+    tsn_lang_rust
+    tsn_lang_java
+
+    ; Language introspection
+    tsn_language_abi
+    tsn_language_symbol_count
+    tsn_language_field_count
+    tsn_language_symbol_name
+    tsn_language_field_name_for_id
+
+    ; Parser
+    tsn_parser_new
+    tsn_parser_delete
+    tsn_parser_set_language
+    tsn_parser_parse_utf8
+    tsn_parser_reset
+
+    ; Tree
+    tsn_tree_delete
+    tsn_tree_copy
+    tsn_tree_root_node
+    tsn_tree_language
+    tsn_tree_edit
+
+    ; Node: predicates
+    tsn_node_is_null
+    tsn_node_is_named
+    tsn_node_is_missing
+    tsn_node_is_extra
+    tsn_node_is_error
+    tsn_node_has_error
+    tsn_node_has_changes
+    tsn_node_eq
+
+    ; Node: position
+    tsn_node_start_byte
+    tsn_node_end_byte
+    tsn_node_start_point
+    tsn_node_end_point
+
+    ; Node: identity
+    tsn_node_type
+    tsn_node_symbol
+    tsn_node_grammar_type
+
+    ; Node: navigation
+    tsn_node_parent
+    tsn_node_child
+    tsn_node_named_child
+    tsn_node_child_count
+    tsn_node_named_child_count
+    tsn_node_next_sibling
+    tsn_node_prev_sibling
+    tsn_node_next_named_sibling
+    tsn_node_prev_named_sibling
+    tsn_node_child_by_field_name
+    tsn_node_field_name_for_child
+    tsn_node_descendant_for_byte_range
+    tsn_node_named_descendant_for_byte_range
+    tsn_node_string
+
+    ; Tree cursor
+    tsn_cursor_new
+    tsn_cursor_delete
+    tsn_cursor_reset
+    tsn_cursor_current_node
+    tsn_cursor_current_field_name
+    tsn_cursor_goto_first_child
+    tsn_cursor_goto_next_sibling
+    tsn_cursor_goto_parent
+    tsn_cursor_current_depth
+
+    ; Query
+    tsn_query_new
+    tsn_query_delete
+    tsn_query_pattern_count
+    tsn_query_capture_count
+    tsn_query_string_count
+    tsn_query_capture_name_for_id
+    tsn_query_string_value_for_id
+    tsn_query_predicate_step_count
+    tsn_query_predicate_step
+    tsn_query_start_byte_for_pattern
+
+    ; Query cursor and matches
+    tsn_query_cursor_new
+    tsn_query_cursor_delete
+    tsn_query_cursor_exec
+    tsn_query_cursor_set_byte_range
+    tsn_match_new
+    tsn_match_delete
+    tsn_query_cursor_next_match
+    tsn_match_pattern_index
+    tsn_match_capture_count
+    tsn_match_capture
+
+    ; Memory
+    tsn_free_string

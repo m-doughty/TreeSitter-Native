@@ -1,0 +1,951 @@
+=begin pod
+
+=head1 NAME
+
+TreeSitter::Native — tree-sitter for Raku: parse, navigate and query
+source code in nine bundled languages
+
+=head1 SYNOPSIS
+
+=begin code :lang<raku>
+use TreeSitter::Native;
+use TreeSitter::Native::Query;
+use TreeSitter::Native::Languages;
+
+my $parser = Parser.new('python');
+my $tree   = $parser.parse(q:to/PY/);
+    def greet(name):
+        return shout(name)
+    PY
+
+# Navigate: fields are the readable way into a node.
+my $def = $tree.root-node.named-child(0);
+say $def.type;                                 # function_definition
+say $def.child-by-field-name('name').text;     # greet
+say $def.start-point;                          # 0:0
+
+# Query: the grammar author's own tags.scm, predicates and all.
+my $tags = Query.new('python', tags-query('python'));
+
+for $tags.matches($tree.root-node) -> $match {
+    my $kind = $match.captures.keys.first(*.contains('.'));
+    say "$kind\t{$match.captures<name>.text}";
+}
+# definition.function    greet
+# reference.call         shout
+=end code
+
+No C toolchain, no C<tree-sitter> CLI, no grammar shopping: the runtime
+and all nine grammars are compiled into one shared library that
+C<zef install> either downloads prebuilt or builds from pinned sources.
+
+=head1 DESCRIPTION
+
+L<tree-sitter|https://tree-sitter.github.io/tree-sitter/> is an
+incremental parser generator with error recovery: it produces a concrete
+syntax tree for a file whether or not that file is valid, which is what
+makes it the parsing engine behind most editors' structural features.
+This distribution is a NativeCall binding to it, bundling the tree-sitter
+runtime and nine generated grammars in a single library.
+
+Five modules, in the order you are likely to need them:
+
+=begin table
+Module                        | What it gives you
+==============================|=========================================
+TreeSitter::Native            | Parser, Tree, Node, Cursor — the ergonomic layer
+TreeSitter::Native::Query     | Query, Match, and predicate evaluation
+TreeSitter::Native::Languages | the nine grammars by name, and their vendored .scm queries
+TreeSitter::Native::Types     | enums (QueryErrorKind, PredicateStepType, …) and X::TreeSitter::Query
+TreeSitter::Native::FFI       | the raw tsn_* bindings, for what the layers above do not cover
+=end table
+
+Two things distinguish this binding from a thin wrapper, and both are
+correctness rather than convenience:
+
+=item B<Query predicates are evaluated.> The C library parses
+C<(#eq? …)> and C<(#match? …)> clauses and then deliberately ignores
+them, leaving their meaning to bindings. A binding that skips that step
+returns matches its own queries say to exclude — the bundled javascript
+C<tags.scm> reports every C<constructor> as a method and every
+C<require(…)> as a call. See B<QUERIES>, below.
+
+=item B<Offsets are byte offsets, and the API refuses to pretend
+otherwise.> C<Node.text> slices the tree's UTF-8 buffer rather than the
+C<Str>, because C<"\r\n"> is one Raku grapheme and two bytes. See
+B<BYTE OFFSETS>, below.
+
+=head1 INSTALLATION
+
+=begin code :lang<shell>
+zef install TreeSitter::Native
+=end code
+
+=head2 The prebuilt path (default)
+
+C<Build.rakumod> downloads one prebuilt library for the detected
+platform from this distribution's GitHub releases, verifies its SHA-256
+against the C<resources/checksums.txt> that shipped in the distribution,
+and stages it into C<resources/lib/>. A checksum that is absent or does
+not match is a hard failure of that path, never a "warn and continue" —
+the bundled digests are a security boundary.
+
+=begin table
+Platform                   | Artefact slug
+===========================|=====================================
+macOS, arm64 and x86_64    | macos-universal (one universal dylib)
+Linux x86_64, glibc        | linux-x86_64-glibc
+Linux aarch64, glibc       | linux-aarch64-glibc
+Windows x86_64             | windows-x86_64
+Windows arm64              | windows-arm64
+=end table
+
+The Linux artefacts are built against glibc 2.35. On an older glibc the
+prebuilt would load and then die at the first call, so C<Build.rakumod>
+reads C<ldd --version> and skips straight to the source path instead.
+musl systems take the source path for the same reason.
+
+=head2 The source path (fallback)
+
+Taken automatically when there is no usable prebuilt, and on demand with
+C<TREESITTER_NATIVE_BUILD_FROM_SOURCE=1>. It needs:
+
+=item A C compiler — C<cc> on Unix (Xcode command line tools, GCC,
+Clang), C<cl.exe> from MSVC on Windows. Build from a Developer Command
+Prompt, or run C<vsdevcmd.bat> first, so C<cl.exe> is on the path.
+C</bigobj> and C</utf-8> are applied for you: the largest generated
+parser (C++, 17 MB of C) exceeds MSVC's default section limit, and
+several grammars carry non-ASCII bytes in string literals.
+
+=item C<curl> and C<tar>. Both ship with every Unix we target and with
+Windows 10 1803 and later (Windows' C<tar> is bsdtar, which handles the
+C<.tar.gz> archives fine). They are probed before the first download so
+that a missing one is a sentence rather than a zero-byte tarball.
+
+=item Network access to C<github.com>, or a pre-staged source tree —
+see B<Offline and air-gapped installs>, below.
+
+The generated C for nine grammars totals around 56 MB, which is far too
+much to vendor in a distribution tarball, so the source path downloads
+nine tag archives pinned by name, tag, URL and SHA-256 in the
+C<SOURCE_PINS> file at the distribution root. Each is verified before it
+is unpacked, cached under C<$XDG_CACHE_HOME> so a second install reuses
+it, then compiled as 17 translation units and linked into one library.
+Budget one to three minutes on a cold cache; most of that is the
+download. macOS builds a universal binary (arm64 + x86_64) exactly as
+the release pipeline does, so the two paths produce interchangeable
+artefacts.
+
+The result is one library of roughly 20 MB with no dependencies beyond
+libc — that is the price of nine grammars' parse tables, and it is paid
+once.
+
+=head2 Environment variables
+
+Build-time knobs, read by C<Build.rakumod>:
+
+=begin table
+Variable                                 | Effect
+=========================================|===========================================
+TREESITTER_NATIVE_BUILD_FROM_SOURCE=1    | Skip the prebuilt download; always compile.
+TREESITTER_NATIVE_BINARY_ONLY=1          | Refuse to fall back to compiling. Fail instead. (CI fail-fast.)
+TREESITTER_NATIVE_BINARY_URL=URL         | Base URL for prebuilt artefacts — mirrors, internal repos.
+TREESITTER_NATIVE_CACHE_DIR=PATH         | Root of both caches: downloaded binaries and extracted sources.
+TREESITTER_NATIVE_VENDOR_DIR=PATH        | Compile from a pre-staged source tree instead of downloading.
+=end table
+
+And one runtime knob, C<TREESITTER_NATIVE_LIB>, read by
+C<TreeSitter::Native::FFI> when the library is first opened: it loads
+the library at that path instead of the staged one. It must be an
+B<absolute> path to an existing file, because the value goes to
+C<dlopen> / C<LoadLibrary> verbatim — a relative path would be resolved
+against the loader's search list rather than your working directory. A
+value that is relative, or that names no readable file, is an error
+rather than a silent fall-through: someone who sets that variable means
+it.
+
+=head2 Offline and air-gapped installs
+
+C<TREESITTER_NATIVE_VENDOR_DIR> points the source path at a directory
+you laid out yourself, and skips both the download and the digest check:
+
+=begin code :lang<shell>
+# One directory per SOURCE_PINS row, named <name>-<tag>, each holding
+# that upstream's repository root:
+#
+#   /srv/ts-sources/tree-sitter-v0.26.12/lib/src/lib.c
+#   /srv/ts-sources/tree-sitter-python-v0.25.0/src/parser.c
+#   …
+TREESITTER_NATIVE_VENDOR_DIR=/srv/ts-sources \
+TREESITTER_NATIVE_BUILD_FROM_SOURCE=1 \
+  zef install TreeSitter::Native
+=end code
+
+GitHub's tag archives are not guaranteed byte-stable across archiver
+upgrades, so a digest mismatch is possible without anything sinister
+having happened. It still aborts the build — compiling unverified source
+is not a thing this distribution does — and the recovery is either the
+vendor directory above or re-pinning the row in C<SOURCE_PINS> after
+re-hashing the tarball yourself.
+
+=head1 LANGUAGES
+
+Nine grammars are linked in. There is no dynamic grammar loading and no
+C<tree-sitter-cli> at runtime; C<TreeSitter::Native::Languages> is the
+map from a name to a compiled grammar.
+
+=begin table
+Name         | Upstream tag | Language ABI | Vendored queries
+=============|==============|==============|===========================
+c            | v0.24.2      | 15           | highlights, tags
+cpp          | v0.23.4      | 14           | highlights, injections, tags
+go           | v0.25.0      | 15           | highlights, tags
+java         | v0.23.5      | 14           | highlights, tags
+javascript   | v0.25.0      | 15           | highlights, highlights-jsx, highlights-params, injections, locals, tags
+python       | v0.25.0      | 15           | highlights, tags
+rust         | v0.24.2      | 15           | highlights, injections, tags
+tsx          | v0.23.2      | 14           | highlights, locals, tags
+typescript   | v0.23.2      | 14           | highlights, locals, tags
+=end table
+
+The bundled runtime is tree-sitter 0.26.12, which implements language
+ABI 15 and accepts grammars down to ABI 13, so the ABI-14 grammars are
+supported rather than merely tolerated. C<tsx> and C<typescript> come
+from one repository but are two distinct grammars, not aliases: they
+disagree about C<< <T> >>.
+
+=begin code :lang<raku>
+use TreeSitter::Native::Languages;
+
+say languages();                   # (c cpp go java javascript python
+                                   #  rust tsx typescript)
+say is-language('python');         # True
+say is-language('Python');         # False — names are case-sensitive
+say language-abi('cpp');           # 14
+
+my $lang = language('rust');       # a TSLanguage for Parser/Query
+=end code
+
+An unknown name dies with the whole list of valid ones, because the
+caller is usually a file-extension map and "which ones I<are> there?" is
+always the next question.
+
+=head1 PARSING
+
+C<Parser> holds a grammar plus the scratch state one parse needs. It is
+not thread-safe — give each thread its own — but it is cheap enough to
+make per file if that is simpler than pooling.
+
+=begin code :lang<raku>
+use TreeSitter::Native;
+
+my $parser = Parser.new('go');          # or Parser.new then .set-language
+my $tree   = $parser.parse('package main; func main() {}');
+
+say $tree.root-node.type;               # source_file
+
+# Parsing never fails on malformed input: tree-sitter recovers and marks
+# the damage. Ask the tree whether it is damaged.
+my $broken = $parser.parse('package main; func main( {');
+say $broken.root-node.has-error;        # True
+=end code
+
+C<.parse(Str)> encodes to UTF-8 exactly once and hands the buffer to the
+C<Tree>. C<.parse-bytes(Blob)> takes bytes you already have — a slurped
+file, a network payload — with no decode/encode round trip, and works
+even when those bytes are not valid UTF-8 (see B<BYTES THAT ARE NOT
+UTF-8>).
+
+=head1 TREES
+
+A C<Tree> is a parse result: the syntax tree plus the exact bytes it
+describes. It is independent of the parser that produced it — disposing
+the parser does not touch it — and of every other tree.
+
+=begin code :lang<raku>
+say $tree.root-node.type;      # module
+say $tree.byte-length;         # source length IN BYTES
+say $tree.source;              # the original Str (Str type object for
+                               # a parse-bytes tree)
+say $tree.bytes.elems;         # same as .byte-length
+
+my $copy = $tree.clone;        # independent C allocation, shared bytes
+$copy.dispose;
+=end code
+
+=head1 NODES
+
+C<Node> is an immutable handle on one node: a copy of tree-sitter's
+32-byte node handle plus a reference to the C<Tree>, which is what keeps
+the tree alive for as long as any node of it is reachable.
+
+Nodes are B<value objects>. Two handles on the same node of the same
+tree are C<===>, hash to the same slot, and behave in sets and bags the
+way you would want when building a graph over a file:
+
+=begin code :lang<raku>
+my $a = $root.named-child(0);
+my $b = $root.child(0);
+
+say $a === $b;                          # True
+say ($a, $b).Set.elems;                 # 1
+say $a.equals($b);                      # True — asked of tree-sitter
+
+my %count is Bag = $root.walk;          # node => how many times seen
+say %count{$a};                         # 1
+=end code
+
+Navigation accessors return the C<Node> B<type object> when there is no
+such node, so they compose with C<with>, C<//> and C<andthen> instead of
+with null checks:
+
+=begin code :lang<raku>
+with $node.child-by-field-name('name') -> $name {
+    say $name.text;                     # greet
+}
+say $root.parent.defined;               # False — the root has no parent
+say ($node.next-sibling // 'none').Str; # none
+=end code
+
+The accessors, grouped:
+
+=item B<Identity and kind> — C<.type>, C<.grammar-type>, C<.symbol>,
+C<.equals($other)>, C<.WHICH>.
+
+=item B<Predicates> — C<.is-named>, C<.is-missing>, C<.is-extra>,
+C<.is-error>, C<.has-error>, C<.has-changes>.
+
+=item B<Position> — C<.start-byte>, C<.end-byte>, C<.byte-length>,
+C<.start-point>, C<.end-point>. Points are C<row>/C<column> pairs, both
+zero-based, the column in bytes.
+
+=item B<Text> — C<.text> (the bytes, decoded as UTF-8) and
+C<.byte-slice> (the bytes themselves, which always works).
+
+=item B<Structure> — C<.child($i)>, C<.named-child($i)>, C<.children>,
+C<.named-children>, C<.child-count>, C<.named-child-count>, C<.parent>,
+C<.next-sibling>, C<.prev-sibling>, C<.next-named-sibling>,
+C<.prev-named-sibling>, C<.child-by-field-name($field)>,
+C<.field-name-for-child($i)>, C<.descendant-for-byte-range($a, $b)>,
+C<.named-descendant-for-byte-range($a, $b)>.
+
+=item B<Traversal> — C<.walk> and C<.named-walk> are lazy pre-order
+C<Seq>s; C<.cursor> is the allocation-free alternative below.
+
+=item B<Debugging> — C<.sexp> is tree-sitter's own S-expression of the
+whole subtree. Useful at a REPL, far too big for a log line.
+
+"Named" is the distinction between the nodes a grammar gives names to
+and the punctuation and keywords it does not:
+
+=begin code :lang<raku>
+my $call = $root.walk.first(*.type eq 'call');
+say $call.children.map(*.type).join(' ');        # identifier argument_list
+say $call.named-children.map(*.type).join(' ');  # identifier argument_list
+
+my $args = $call.child-by-field-name('arguments');
+say $args.children.map(*.type).join(' ');        # ( identifier )
+say $args.named-children.map(*.type).join(' ');  # identifier
+=end code
+
+Finding things is C<.walk> plus C<.grep>, which reads the way you would
+say it out loud:
+
+=begin code :lang<raku>
+my @calls = $root.walk.grep(*.type eq 'call').eager;
+say @calls.map({ .child-by-field-name('function').text });   # (shout)
+=end code
+
+=head1 CURSORS
+
+C<Node.walk> allocates a C<Node> per step. A cursor moves in place, and
+is what to reach for on a whole-file walk. It is not exported — Raku's
+core already binds C<Cursor> — so build one with C<Node.cursor> or
+C<Tree.cursor>, or name it C<TreeSitter::Native::Cursor> in full.
+
+=begin code :lang<raku>
+my $c = $tree.cursor;
+LEAVE $c.dispose;
+
+while $c.goto-first-child {
+    say '  ' x $c.current-depth,
+        ($c.current-field-name // '-'), ' ', $c.current-node.type;
+}
+#   - function_definition
+#     - def
+=end code
+
+C<.walk> on a cursor yields the same nodes in the same order as
+C<Node.walk> without the intermediate objects. It B<drives the cursor>,
+so do not interleave it with your own C<goto-> calls, and C<.reset> a
+cursor before walking it twice:
+
+=begin code :lang<raku>
+my $cursor = $root.cursor;
+LEAVE $cursor.dispose;
+
+say $cursor.walk.map(*.type).head(4).join(' ');
+# module function_definition def identifier
+
+$cursor.reset($root);
+say $cursor.walk.elems == $root.walk.elems;      # True
+=end code
+
+Depths are relative to the node the cursor started on or was last reset
+to: that node is depth 0, and the cursor will not climb above it.
+
+=head1 BYTE OFFSETS
+
+Every offset in this distribution — C<start-byte>, C<end-byte>, point
+columns, the byte ranges you can restrict a query to, the offset in a
+query error — is a byte offset into the B<UTF-8 encoding> of the source.
+Not a character index, and emphatically not a grapheme index.
+
+This matters more than it sounds, because Raku's C<Str> is a sequence of
+graphemes:
+
+=begin code :lang<raku>
+say 'größe'.chars;                     # 5
+say 'größe'.encode('utf-8').elems;     # 7
+say "\r\n".chars;                      # 1  — ONE grapheme
+say "\r\n".encode('utf-8').elems;      # 2  — TWO bytes
+=end code
+
+So a file with any non-ASCII identifier, or any Windows line ending,
+has character offsets that drift further from its byte offsets on every
+occurrence. Slicing the source C<Str> with C<.substr> and a tree-sitter
+offset produces quiet nonsense — the worst kind.
+
+C<Parser.parse> therefore encodes once and hands the buffer to the
+C<Tree>; C<Node.text> slices B<that> and decodes the slice. Do your own
+slicing the same way:
+
+=begin code :lang<raku>
+my $mb   = $parser.parse("def größe(wert):\n    return wert\n");
+my $name = $mb.root-node.named-child(0).child-by-field-name('name');
+
+say $name.text;                        # größe
+say $name.start-byte, '..', $name.end-byte;   # 4..11
+say $name.byte-length;                 # 7 bytes for 5 characters
+
+# The right way to slice by hand:
+say $mb.bytes.subbuf($name.start-byte,
+                     $name.end-byte - $name.start-byte)
+            .decode('utf-8');          # größe
+
+# …which is what .byte-slice already does:
+say $name.byte-slice.decode('utf-8') eq $name.text;      # True
+
+# And the wrong way, kept here as a warning:
+say $mb.source.substr($name.start-byte,
+                      $name.end-byte - $name.start-byte); # größe(w
+=end code
+
+Point columns are byte columns too, for the same reason.
+
+=head1 QUERIES
+
+A query is one or more S-expression patterns compiled against a grammar
+and matched against a subtree. It is the same language the C<tree-sitter>
+CLI and every editor integration uses, and the C<.scm> files each grammar
+ships are written in it.
+
+=begin code :lang<raku>
+use TreeSitter::Native;
+use TreeSitter::Native::Query;
+
+my $parser = Parser.new('rust');
+my $tree   = $parser.parse('fn greet(name: &str) -> &str { name }');
+
+my $q = Query.new('rust', '(function_item name: (identifier) @fn)');
+say $q.pattern-count;                            # 1
+say $q.capture-names;                            # (fn)
+
+for $q.matches($tree.root-node) -> $m {
+    say $m.pattern-index, ' ', $m.captures<fn>.text;    # 0 greet
+}
+=end code
+
+Compiling is the expensive part — a full C<tags.scm> is hundreds of
+patterns — so build a query once and reuse it across files. A query is
+tied to the grammar it was compiled against, not to any particular tree.
+
+Two shapes of result:
+
+=item C<.matches($node)> — a lazy C<Seq> of C<Match> objects, each
+carrying its C<.pattern-index> and its captures. C<.captures> is a
+C<name => Node> hash keeping the first node per name; C<.nodes($name)>
+returns every node captured under a name (a C<(comment)* @doc> capture
+yields several); C<.entries> is the raw ordered list.
+
+=item C<.captures($node)> — every capture of every accepted match,
+flattened into a lazy C<Seq> of C<name => Node> pairs, for when you do
+not care which pattern or match produced them.
+
+=begin code :lang<raku>
+my $q = Query.new('python', '(identifier) @id');
+
+for $q.captures($root) -> (:key($name), :value($n)) {
+    say "$name: {$n.text}";
+}
+# id: greet
+# id: name
+# id: shout
+# id: name
+=end code
+
+=head2 Predicates are evaluated here
+
+tree-sitter's C library parses the C<(#eq? @a "x")> clauses inside a
+pattern and then does nothing with them, because what they mean depends
+on how the binding can read node text. This binding evaluates six:
+
+=begin table
+Predicate                   | Meaning
+============================|=============================================
+(#eq? @a "text")            | every node captured as @a has that text
+(#eq? @a @b)                | @a and @b capture the same text, pairwise
+(#not-eq? …)                | the negation of either form
+(#match? @a "regex")        | every node captured as @a matches
+(#not-match? @a "regex")    | no node captured as @a matches
+(#any-of? @a "x" "y")       | every @a node's text is one of the list
+(#not-any-of? @a "x" "y")   | no @a node's text is
+=end table
+
+A capture a match does not contain has no nodes, and a predicate over no
+nodes is vacuously true — the rule tree-sitter's own bindings use. Text
+comparison for C<#eq?> and C<#any-of?> is done on bytes, so it is exact
+even for source that does not decode as UTF-8.
+
+This is not a nicety. The bundled javascript C<tags.scm> is wrong
+without it:
+
+=begin code :lang<raku>
+use TreeSitter::Native;
+use TreeSitter::Native::Query;
+use TreeSitter::Native::Languages;
+
+my $parser = Parser.new('javascript');
+my $tree   = $parser.parse(q:to/JS/);
+    class Widget {
+        constructor(opts) { this.opts = opts; }
+        render() { return draw(this.opts); }
+    }
+    const fs = require('fs');
+    JS
+
+my $q = Query.new('javascript', tags-query('javascript'));
+
+my @names = $q.matches($tree.root-node)
+             .map({ .captures<name> andthen .text })
+             .grep(*.defined).unique.sort;
+say @names;              # [Widget draw render]
+
+# constructor was excluded by (#not-eq? @name "constructor"), and
+# require by (#not-match? @name "^(require)$"). The raw cursor — which
+# applies no predicates — still sees both:
+my $c = $q.cursor($tree.root-node);
+LEAVE $c.dispose;
+my @raw;
+while $c.next-match -> $m {
+    @raw.push($_) with ($m.captures<name> andthen .text);
+}
+say @raw.grep({ $_ eq 'constructor' | 'require' }).unique.sort;
+# (constructor require)
+=end code
+
+C<.accepts($match)> is that filter, and is public precisely so a
+hand-driven cursor loop can apply it: C<next unless $q.accepts($m)>.
+
+=head2 Directives are exposed, not applied
+
+Clauses ending in C<!> rather than C<?> — C<#set!>, C<#strip!>,
+C<#select-adjacent!> — are B<directives>. They do not filter matches;
+they tell the consuming application to do something with one. There is
+no agreed set of them and no agreed semantics, so this binding parses
+them, hands them to you, and applies none:
+
+=begin code :lang<raku>
+use TreeSitter::Native::Query;
+use TreeSitter::Native::Languages;
+
+my $q = Query.new('javascript', tags-query('javascript'));
+
+my $p = (^$q.pattern-count).first({
+    $q.pattern-directives($_).elems >= 2;
+});
+
+for $q.pattern-directives($p) -> $d {
+    say $d.name, ' ', $d.args.map(*.value).join(' ');
+}
+# strip! doc ^[\s\*/]+|^[\s\*/]$
+# select-adjacent! doc definition.method
+=end code
+
+In every bundled C<tags.scm>, the directives shape only the C<@doc>
+capture — which comment block belongs to which definition, and how much
+leading C<*> to strip off it. Nothing else is affected by their absence.
+Each clause is a C<Predicate> object with C<.name>, C<.args> (each an
+C<Arg> with C<.kind> and C<.value>), C<.is-directive> and C<.evaluated>;
+C<.pattern-predicates($i)> returns all clauses of a pattern,
+C<.pattern-directives($i)> just the C<!> ones.
+
+=head2 Unknown predicates fail closed
+
+A query naming a predicate outside the table above is rejected at
+construction with an C<X::TreeSitter::Query> of kind
+C<QUERY_ERROR_PREDICATE>. Ignoring it silently would mean returning
+matches the query says to exclude, which is the bug this module exists
+to avoid.
+
+=begin code :lang<raku>
+use TreeSitter::Native::Query;
+use TreeSitter::Native::Types;
+
+my $scm = '((identifier) @a (#is-not? @a local))';
+
+my $err = (try Query.new('python', $scm)) // $!;
+say $err.kind;                              # QUERY_ERROR_PREDICATE
+say $err.message.contains('pass :lenient'); # True
+
+# Take the matches anyway — the clause is parsed, exposed, and ignored:
+my $q = Query.new('python', $scm, :lenient);
+say $q.pattern-predicates(0)[0].name;       # is-not?
+say $q.pattern-predicates(0)[0].evaluated;  # False
+=end code
+
+C<:lenient> covers unrecognised B<names> only. A C<#eq?> with three
+arguments is a malformed query however lenient you feel, and is rejected
+either way.
+
+Exactly one vendored query needs C<:lenient> — javascript's
+C<highlights.scm>, which uses C<#is-not? @x local>, an editor-ecosystem
+property predicate rather than a text filter. The other twenty-five
+vendored queries, C<tags.scm> and C<highlights.scm> alike, compile
+without it:
+
+=begin code :lang<raku>
+use TreeSitter::Native::Query;
+use TreeSitter::Native::Languages;
+
+for languages() -> $lang {
+    for query-kinds($lang) -> $kind {
+        my Bool $lenient = $lang eq 'javascript' && $kind eq 'highlights';
+        my $q = Query.new($lang, query-source($lang, $kind), :$lenient);
+        say sprintf('%-11s %-18s %3d patterns%s', $lang, $kind,
+                    $q.pattern-count, $lenient ?? '  (:lenient)' !! '');
+        $q.dispose;
+    }
+}
+=end code
+
+=head2 Regular expressions
+
+C<#match?> patterns are written in the query file in Perl/PCRE-ish
+syntax. Raku's regex engine is not Perl's, and Raku has no runtime
+"compile this string as a Perl 5 regex" short of C<EVAL> — which, on a
+pattern that came out of someone else's C<.scm> file, is a remote code
+execution hole rather than a feature. Nor can the string be handed to
+Raku's C<< /<$pattern>/ >> directly: in Raku C<[abc]> is a non-capturing
+I<group> rather than a character class, and C<{2,3}> is a I<code block>,
+which would execute the very input we are trying not to trust.
+
+So patterns are translated, at query construction, into equivalent Raku
+regex source built entirely out of constructs the translator emits, with
+every literal run quoted. Anything it cannot translate faithfully is a
+construction-time error rather than a silently different match.
+
+Translated: literals, C<.>, C<^>, C<$>, C<\A>, C<\z>, C<\Z>, C<\b>,
+C<\B>, the C<\d \D \w \W \s \S \n \r \t \f \e> escapes, C<\xHH> and
+C<\x{HHHH}>, character classes with ranges and negation, groups
+(capturing, C<(?:…)>, C<< (?<name>…) >>), lookaround (C<(?=…)>,
+C<(?!…)>, C<< (?<=…) >>, C<< (?<!…) >>), the C<(?i)> and C<(?i:…)>
+flags, alternation, C<*> C<+> C<?> with their lazy forms, and C<{n}> /
+C<{n,}> / C<{n,m}>.
+
+Rejected, loudly: backreferences, possessive quantifiers, POSIX bracket
+classes (C<[:alpha:]>), and any other C<(?…)> construct.
+
+Two deliberate approximations, documented so they cannot surprise you
+quietly:
+
+=item C<$> means end-of-string here, where Perl also lets it match
+before a final newline.
+
+=item Alternation becomes Raku's C<||>, which tries alternatives left to
+right exactly as Perl does. Raku's bare C<|> would prefer the longest
+match instead.
+
+Since C<#match?> only ever asks whether a match exists, neither changes
+an answer for any pattern that is not itself ambiguous.
+
+=head2 Restricting a query to a byte range
+
+Querying one function of a large file does not need a re-parse:
+
+=begin code :lang<raku>
+use TreeSitter::Native;
+use TreeSitter::Native::Query;
+
+my $parser = Parser.new('python');
+my $tree   = $parser.parse("a = 1\nb = 2\nc = 3\n");
+my $root   = $tree.root-node;
+my $q      = Query.new('python', '(identifier) @id');
+
+say $q.captures($root).map({ .value.text });                   # (a b c)
+say $q.captures($root, :start-byte(6), :end-byte(11))
+      .map({ .value.text });                                   # (b)
+
+my $stmt = $root.named-child(2);
+say $q.captures($root, :start-byte($stmt.start-byte),
+                       :end-byte($stmt.end-byte))
+      .map({ .value.text });                                   # (c)
+=end code
+
+Both are byte offsets. An empty range (equal start and end) yields
+nothing — which needs saying, because tree-sitter itself reads an end
+byte of C<0> as "no limit" and would hand back the whole file; that
+quirk is normalised here. A range whose start is past its end is a
+caller mistake and throws.
+
+=head2 Driving the cursor yourself
+
+C<.matches> creates, drives and disposes a query cursor for you, and
+disposes it when the C<Seq> is exhausted. Abandoning a partly-consumed
+C<Seq> leaves the cursor to the garbage collector — safe, but not
+prompt. When that matters, or when you want the raw unfiltered matches,
+drive it yourself:
+
+=begin code :lang<raku>
+use TreeSitter::Native;
+use TreeSitter::Native::Query;
+
+my $parser = Parser.new('python');
+my $tree   = $parser.parse("foo(1)\nbar(2)\n");
+my $q      = Query.new('python', '((call function: (identifier) @f)
+                                   (#eq? @f "foo"))');
+
+my $c = $q.cursor($tree.root-node);
+LEAVE $c.dispose;
+
+while $c.next-match -> $m {
+    next unless $q.accepts($m);          # .next-match does NOT filter
+    say $m.captures<f>.text;             # foo
+}
+=end code
+
+=head1 ERRORS
+
+Query failures are typed. C<X::TreeSitter::Query> carries a machine-
+readable C<.kind> (a C<QueryErrorKind> from
+C<TreeSitter::Native::Types>), the byte C<.offset> into the query
+source, and the C<.source> itself, from which the human-facing C<.line>,
+C<.column> and C<.snippet> are derived:
+
+=begin code :lang<raku>
+use TreeSitter::Native::Query;
+use TreeSitter::Native::Types;
+
+my $err = (try Query.new('python', '(no_such_node) @x')) // $!;
+
+say $err.kind;                  # QUERY_ERROR_NODE_TYPE
+say $err.kind-description;      # node type
+say $err.offset;                # 1     (a BYTE offset)
+say $err.line, ':', $err.column;# 1:2
+say $err.snippet;               # no_such_node) @x
+say $err.message;
+# tree-sitter query error (node type) at byte 1, line 1 column 2: no_such_node) @x
+=end code
+
+The kinds are tree-sitter's own — C<QUERY_ERROR_SYNTAX>,
+C<QUERY_ERROR_NODE_TYPE>, C<QUERY_ERROR_FIELD>, C<QUERY_ERROR_CAPTURE>,
+C<QUERY_ERROR_STRUCTURE>, C<QUERY_ERROR_LANGUAGE> — plus one addition,
+C<QUERY_ERROR_PREDICATE>, for a query that is valid tree-sitter but
+names a predicate this binding will not evaluate. It needs a kind of its
+own so a C<when> chain can tell "your query is not valid" apart from
+"your query is valid but I cannot honour it":
+
+=begin code :lang<raku>
+use TreeSitter::Native::Query;
+use TreeSitter::Native::Types;
+
+for '(function_definition',                     # syntax
+    '(no_such_node) @x',                        # node type
+    '((identifier) @a (#nope? @a "x"))'         # predicate
+    -> $scm
+{
+    my $e = (try Query.new('python', $scm)) // $!;
+    given $e.kind {
+        when QUERY_ERROR_SYNTAX    { say 'not a valid query' }
+        when QUERY_ERROR_PREDICATE { say 'unsupported #…?' }
+        default                    { say $e.kind-description }
+    }
+}
+# not a valid query
+# node type
+# unsupported #…?
+=end code
+
+Everything else — an unknown grammar name, a query kind a grammar does
+not ship, use after C<.dispose>, an inside-out byte range — throws a
+plain exception whose message names the mistake and, where there is a
+list to give, gives it.
+
+=head1 VENDORED QUERIES AND LICENCES
+
+Every grammar's own C<.scm> query files are vendored in this
+distribution's C<resources/>, copied verbatim from the grammar
+repository at the tag pinned in C<SOURCE_PINS>. Reading them needs no
+native library at all:
+
+=begin code :lang<raku>
+use TreeSitter::Native::Languages;
+
+my $tags = tags-query('go');            # queries/go/tags.scm
+my $hl   = highlights-query('go');      # queries/go/highlights.scm
+my $loc  = query-source('typescript', 'locals');
+
+say query-kinds('rust');                # (highlights injections tags)
+say $tags.lines.grep(*.contains('@definition.function')).head.trim;
+# name: (identifier) @name) @definition.function
+=end code
+
+C<tags.scm> is the code-navigation query the tree-sitter project
+maintains, capturing C<@definition.*> and — for most grammars —
+C<@reference.*>. Note that the C and C++ tags queries are
+definitions-only upstream: they capture no C<@reference.*> at all.
+C<highlights.scm> is the syntax-colouring query, capturing C<@keyword>,
+C<@string>, C<@function> and friends.
+
+The queries and the compiled grammars are the work of the tree-sitter
+project and its grammar authors, MIT-licensed; the runtime additionally
+carries Unicode's ICU licence for its character-property tables. Every
+upstream licence file is vendored under C<resources/licenses/> and
+installed with the distribution. This binding — the shim, the Raku
+modules, the build machinery — is Artistic 2.0.
+
+=head1 LIFETIMES
+
+C<Parser>, C<Tree>, C<Cursor>, C<Query> and the query cursor each own a
+C allocation. Each has an idempotent C<.dispose> and a C<DESTROY> that
+calls it, so you may free them explicitly or leave them to the garbage
+collector, and calling C<.dispose> twice — or after C<DESTROY> already
+ran — is harmless.
+
+The rules worth knowing:
+
+=item A C<Tree> outlives the C<Parser> that made it. Disposing a parser
+does not touch trees it produced.
+
+=item A C<Node> keeps its C<Tree> alive by holding a reference to it, so
+ordinary garbage collection can never leave a node pointing into freed
+memory. A C<Cursor> and a query cursor hold the tree the same way.
+
+=item The one thing you can still do wrong is dispose a C<Tree>
+explicitly and then use a C<Node> from it. That is checked: every node
+accessor asks its tree whether it is still alive and throws rather than
+reading freed memory.
+
+=begin code :lang<raku>
+use TreeSitter::Native;
+
+my $root = do {
+    my $parser = Parser.new('python');
+    my $tree   = $parser.parse('x = 1');
+    $parser.dispose;                    # the tree does not care
+    $tree.root-node;
+};
+say $root.type;                         # module — the tree is still alive
+
+$root.tree.dispose;
+say (try $root.type) // 'throws';       # throws
+=end code
+
+=head1 BYTES THAT ARE NOT UTF-8
+
+Pinned behaviour, verified against the bundled runtime rather than
+assumed. tree-sitter is byte-oriented: it does not validate UTF-8, does
+not refuse the input, and does not throw. It parses what it can and
+marks the rest as an C<ERROR> node. This binding passes that through
+unchanged and draws exactly one line — C<.byte-slice> always works,
+C<.text> decodes and therefore throws:
+
+=begin code :lang<raku>
+use TreeSitter::Native;
+
+my $parser = Parser.new('python');
+my $bytes  = Blob[uint8].new(
+    0x64, 0x65, 0x66, 0x20,           # 'def '
+    0xff, 0xfe,                       # not valid UTF-8
+    0x28, 0x29, 0x3a, 0x20,           # '(): '
+    0x70, 0x61, 0x73, 0x73,           # 'pass'
+);
+
+my $tree = $parser.parse-bytes($bytes);
+my $root = $tree.root-node;
+
+say $root.type;                          # module
+say $root.has-error;                     # True
+say $root.walk.grep(*.is-error).elems;   # 2
+say $root.byte-slice.elems;              # 14 — every byte, always
+say (try $root.text) // 'does not decode';  # does not decode
+
+# The parts that DO decode are still readable: one stray byte does not
+# cost you the rest of the file.
+say $root.walk.first(*.type eq 'pass_statement').text;   # pass
+=end code
+
+C<parse(Str)> can never be in this position: a Raku C<Str> always
+encodes to valid UTF-8.
+
+=head1 LIMITATIONS
+
+=item B<There is no Raku grammar.> No usable tree-sitter grammar for
+Raku exists at the time of writing. That is a gap in the ecosystem, not
+an omission here, and C<language('raku')> says so explicitly. If one
+appears it can be added without any API change.
+
+=item B<No incremental parsing at the Raku layer yet.> tree-sitter's
+headline feature — re-parsing an edited file in time proportional to the
+edit — is wired through the C shim (the parse entry point takes a
+nullable old tree, and C<ts_tree_edit> is exported) but is not exposed
+in Raku. Adding it later is purely additive, with no ABI change to the
+library. Until then, re-parse the file: for the file sizes an editor or
+a code-analysis pass deals with, a full parse is milliseconds.
+
+=item B<UTF-8 only, and no streaming input.> The C<TSInput> callback
+interface, UTF-16 input and custom decoders are not wrapped. Source
+arrives as a C<Str> or a C<Blob>, entirely in memory.
+
+=item B<Directives are parsed, not applied> — see B<Directives are
+exposed, not applied> under QUERIES.
+
+=item B<Also not wrapped:> the parser logger, DOT-graph output,
+included ranges (parsing one language embedded in another), and the wasm
+grammar loader.
+
+=item B<C and C++ tag queries are definitions-only upstream>, so a
+reference graph over those two languages needs a supplementary query of
+your own.
+
+=item B<A parser is not thread-safe.> Give each thread its own; trees,
+being immutable once produced, are safe to read from several.
+
+=head1 SEE ALSO
+
+=item L<tree-sitter|https://tree-sitter.github.io/tree-sitter/> — the
+upstream project, whose
+L<query syntax reference|https://tree-sitter.github.io/tree-sitter/using-parsers/queries/index.html>
+documents the pattern language this distribution compiles.
+
+=head1 AUTHOR
+
+Matt Doughty
+
+=head1 LICENSE
+
+Artistic 2.0. The bundled tree-sitter runtime and grammars are MIT, and
+the runtime's Unicode tables carry the ICU licence; see
+C<resources/licenses/>.
+
+=end pod

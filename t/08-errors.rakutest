@@ -1,0 +1,246 @@
+use v6.d;
+use Test;
+use TreeSitter::Native;
+use TreeSitter::Native::Types;
+use TreeSitter::Native::Languages;
+use TreeSitter::Native::Query;
+
+# Failure paths, and the exact behaviour of the awkward ones.
+#
+# Two of these are pins rather than assertions of a design: what
+# tree-sitter does with bytes that are not valid UTF-8, and what this
+# binding does about it. Both are recorded here so that a change in
+# either is a test failure and a decision, not a surprise in a consumer.
+
+# --- Unknown grammar names --------------------------------------------
+
+# The message lists every valid name, because the caller is usually a
+# file-extension map and "which ones ARE there?" is always the next
+# question.
+for <raku perl6 ruby COBOL Python ''> -> Str $bogus {
+    my $err;
+    try {
+        language($bogus);
+        CATCH { default { $err = $_ } }
+    }
+    ok $err.defined, "language('$bogus') fails";
+    ok $err.message.contains('no bundled grammar named'),
+        "  and says so";
+    for languages() -> Str $valid {
+        ok $err.message.contains($valid),
+            "  and lists $valid among the valid names";
+    }
+}
+
+# Uppercase is not folded: grammar names are lower-case, and quietly
+# accepting 'Python' would make the registry ambiguous.
+nok is-language('Python'), 'grammar names are case-sensitive';
+ok  is-language('python'), 'in their documented spelling';
+nok is-language(Str), 'an undefined name is not a grammar';
+
+# The absence of a Raku grammar is a documented fact, not an oversight,
+# so the error says which fact it is.
+my $raku-err;
+try { language('raku'); CATCH { default { $raku-err = $_ } } }
+ok $raku-err.message.contains('no usable tree-sitter grammar for Raku'),
+    'and asking for Raku explains why there is none';
+
+throws-like { Parser.new('raku') }, Exception,
+    message => /'no bundled grammar named'/,
+    'Parser.new passes the same message through';
+throws-like { Query.new('raku', '(x)') }, Exception,
+    message => /'no bundled grammar named'/,
+    'and so does Query.new';
+
+# Query kinds are validated the same way.
+throws-like { query-source('python', 'locals') }, Exception,
+    message => /'ships no'/,
+    'asking a grammar for a query kind it does not ship fails';
+throws-like { query-source('python', 'locals') }, Exception,
+    message => /'highlights, tags'/,
+    'listing the kinds it does ship';
+throws-like { query-kinds('raku') }, Exception,
+    message => /'no bundled grammar named'/,
+    'query-kinds validates the grammar name too';
+
+# --- Malformed queries ------------------------------------------------
+
+my @bad =
+    %( source => '(function_definition',
+       kind   => QUERY_ERROR_SYNTAX,
+       note   => 'an unclosed pattern' ),
+    %( source => '(no_such_node_type) @x',
+       kind   => QUERY_ERROR_NODE_TYPE,
+       note   => 'an unknown node type' ),
+    %( source => '(function_definition no_such_field: (identifier) @x)',
+       kind   => QUERY_ERROR_FIELD,
+       note   => 'an unknown field' ),
+    %( source => '((call) @c (#eq? @nope "x"))',
+       kind   => QUERY_ERROR_CAPTURE,
+       note   => 'a predicate on an undeclared capture' ),
+;
+
+for @bad -> %case {
+    my $err;
+    try {
+        Query.new('python', %case<source>);
+        CATCH { default { $err = $_ } }
+    }
+    isa-ok $err, X::TreeSitter::Query, "{%case<note>} throws the typed error";
+    is $err.kind, %case<kind>, "  with kind {%case<kind>.key}";
+    is $err.source, %case<source>, '  carrying the source it was given';
+    ok $err.offset <= %case<source>.encode('utf-8').elems,
+        '  and a byte offset inside it';
+    ok $err.message.contains('tree-sitter query error'),
+        '  with a message that says what happened';
+}
+
+# The offset really is a BYTE offset, and line/column are derived from
+# it by decoding — which is the only way they can be right for a query
+# with a multibyte string literal above the error.
+my $multibyte = qq:to/Q/;
+    ((identifier) @a (#eq? @a "größe"))
+    (no_such_node) @b
+    Q
+my $mb-err;
+try { Query.new('python', $multibyte); CATCH { default { $mb-err = $_ } } }
+isa-ok $mb-err, X::TreeSitter::Query, 'a multibyte query fails as expected';
+is $mb-err.kind, QUERY_ERROR_NODE_TYPE, 'on the second pattern';
+is $mb-err.line, 2, 'reported on line 2';
+is $mb-err.offset,
+   $multibyte.substr(0, $multibyte.index('no_such_node'))
+             .encode('utf-8').elems,
+   'at the byte offset of the bad node type';
+isnt $mb-err.offset, $multibyte.index('no_such_node'),
+    'which is NOT its character offset';
+ok $mb-err.snippet.starts-with('no_such_node'),
+    'and the snippet starts there';
+ok $mb-err.column > 0, 'the column is 1-based';
+
+# The exception is presentable even with nothing to present.
+my $bare = X::TreeSitter::Query.new(kind => QUERY_ERROR_LANGUAGE);
+is $bare.offset, 0, 'a bare error defaults to offset 0';
+is $bare.line, 1, 'line 1';
+is $bare.column, 1, 'column 1';
+is $bare.snippet, '', 'and an empty snippet';
+ok $bare.message.contains('language'), 'while still naming its kind';
+is X::TreeSitter::Query.new(kind => QUERY_ERROR_PREDICATE)
+       .kind-description,
+   'predicate', 'every kind has a description';
+
+# --- Predicates: fail closed, unless asked not to ---------------------
+
+my $unknown = '((identifier) @a (#no-such-predicate? @a "x"))';
+
+throws-like { Query.new('python', $unknown) },
+    X::TreeSitter::Query,
+    kind => QUERY_ERROR_PREDICATE,
+    'an unknown predicate is rejected at construction';
+throws-like { Query.new('python', $unknown) },
+    X::TreeSitter::Query,
+    message => /'pass :lenient'/,
+    'and the message says how to accept it anyway';
+
+my $lenient = Query.new('python', $unknown, :lenient);
+ok $lenient.defined, ':lenient compiles the same query';
+ok $lenient.lenient, 'and remembers that it was lenient';
+is $lenient.pattern-predicates(0).elems, 1,
+    'the unknown predicate is still exposed';
+is $lenient.pattern-predicates(0)[0].name, 'no-such-predicate?',
+    'under its own name';
+nok $lenient.pattern-predicates(0)[0].evaluated,
+    'flagged as not evaluated';
+nok $lenient.pattern-predicates(0)[0].is-directive,
+    'and it is not a directive either';
+
+my $lparser = Parser.new('python');
+my $ltree = $lparser.parse("x = 1\n");
+is $lenient.matches($ltree.root-node).elems, 1,
+    'and it filters nothing at all';
+
+# :lenient covers unknown NAMES only. A known predicate with the wrong
+# shape is a malformed query however lenient you feel.
+for ('((identifier) @a (#eq? @a))',
+     '((identifier) @a (#eq? @a "x" "y"))',
+     '((identifier) @a (#match? @a @a))',
+     '((identifier) @a (#any-of? @a))',
+     '((identifier) @a (#any-of? @a @a))',
+    ) -> Str $malformed {
+    throws-like { Query.new('python', $malformed) },
+        X::TreeSitter::Query, kind => QUERY_ERROR_PREDICATE,
+        "malformed: $malformed";
+    throws-like { Query.new('python', $malformed, :lenient) },
+        X::TreeSitter::Query, kind => QUERY_ERROR_PREDICATE,
+        "  still malformed with :lenient";
+}
+
+# A predicate whose first argument is a literal rather than a capture
+# has nothing to filter on.
+throws-like { Query.new('python', '((identifier) @a (#eq? "x" @a))') },
+    X::TreeSitter::Query, kind => QUERY_ERROR_PREDICATE,
+    'a predicate needs a capture as its first argument';
+
+# --- Bytes that are not valid UTF-8 -----------------------------------
+#
+# PINNED BEHAVIOUR, verified against the bundled runtime rather than
+# assumed. tree-sitter is byte-oriented: it does not validate UTF-8, it
+# does not refuse the input, and it does not throw. It parses what it
+# can and marks the rest as an ERROR node. This binding passes that
+# through unchanged, and draws exactly one line: .byte-slice always
+# works, .text decodes and therefore throws.
+
+my Blob $invalid = Blob[uint8].new(
+    #  d    e    f    ' '  <-- two bytes that are not valid UTF-8 -->
+    0x64, 0x65, 0x66, 0x20, 0xff, 0xfe,
+    #  (    )    :    ' '  p    a    s    s
+    0x28, 0x29, 0x3a, 0x20, 0x70, 0x61, 0x73, 0x73,
+);
+nok (try $invalid.decode('utf-8')).defined,
+    'the fixture really is not valid UTF-8';
+
+my $iparser = Parser.new('python');
+my $itree;
+lives-ok { $itree = $iparser.parse-bytes($invalid) },
+    'parse-bytes accepts bytes that are not valid UTF-8';
+isa-ok $itree, Tree, 'and returns a tree';
+is $itree.bytes.elems, $invalid.elems, 'holding every byte it was given';
+nok $itree.source.defined, 'with no source Str';
+
+my $iroot = $itree.root-node;
+is $iroot.type, 'module', 'the root node is still the grammar root';
+ok $iroot.has-error, 'flagged as containing an error';
+is $iroot.start-byte, 0, 'spanning from byte 0';
+is $iroot.end-byte, $invalid.elems, 'to the last byte';
+ok $iroot.walk.grep(*.is-error).elems,
+    'with an ERROR node covering the damage';
+
+is $iroot.byte-slice.list, $invalid.list,
+    '.byte-slice hands back exactly the bytes, always';
+dies-ok { $iroot.text },
+    '.text throws on them, because they do not decode';
+
+# The parts that DO decode are still readable, so a stray byte does not
+# cost you the rest of the file.
+my $pass = $iroot.walk.first(*.type eq 'pass_statement');
+ok $pass.defined, 'the valid tail of the file still parsed';
+is $pass.text, 'pass', 'and its text decodes normally';
+
+# Str parsing cannot hit this: a Raku Str always encodes to valid UTF-8.
+is $iparser.parse('pass').root-node.walk
+          .first(*.type eq 'pass_statement').text,
+   'pass',
+   'parse(Str) is never in this position';
+
+# --- Byte ranges ------------------------------------------------------
+
+my $rtree = $iparser.parse("a = 1\nb = 2\n");
+my $rq = Query.new('python', '(identifier) @id');
+throws-like { $rq.cursor($rtree.root-node, :start-byte(9),
+                         :end-byte(2)) },
+    Exception, message => /'byte range'/,
+    'an inside-out byte range is refused';
+lives-ok { $rq.cursor($rtree.root-node, :start-byte(0),
+                      :end-byte(999_999)).dispose },
+    'a range past the end of the file is not';
+
+done-testing;

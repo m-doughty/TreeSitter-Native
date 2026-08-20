@@ -1,0 +1,88 @@
+use v6.d;
+use Test;
+
+# Does the distribution load at all, and does each module put the names
+# it promises where it promises them?
+#
+# This file deliberately exercises no behaviour. Its job is to fail
+# first, and unambiguously, when the native library is missing or its
+# TSNode layout disagrees with TSNodeBuf — because in that case every
+# other file in this directory fails too, with far less helpful
+# messages.
+
+plan 34;
+
+use-ok 'TreeSitter::Native::Types',     'Types loads';
+use-ok 'TreeSitter::Native::FFI',       'FFI loads (and opens the library)';
+use-ok 'TreeSitter::Native::Languages', 'Languages loads';
+use-ok 'TreeSitter::Native',            'the ergonomic layer loads';
+use-ok 'TreeSitter::Native::Query',     'Query loads';
+
+use TreeSitter::Native::Types;
+use TreeSitter::Native::FFI;
+use TreeSitter::Native::Languages;
+use TreeSitter::Native;
+use TreeSitter::Native::Query;
+
+# --- Types -----------------------------------------------------------
+
+is QUERY_ERROR_NONE.value,      0, 'QUERY_ERROR_NONE is 0';
+is QUERY_ERROR_SYNTAX.value,    1, 'QUERY_ERROR_SYNTAX is 1';
+is QUERY_ERROR_LANGUAGE.value,  6, 'QUERY_ERROR_LANGUAGE is 6';
+is QUERY_ERROR_PREDICATE.value, 7, 'QUERY_ERROR_PREDICATE is 7 (ours)';
+is PREDICATE_STEP_DONE.value,    0, 'PREDICATE_STEP_DONE is 0';
+is PREDICATE_STEP_CAPTURE.value, 1, 'PREDICATE_STEP_CAPTURE is 1';
+is PREDICATE_STEP_STRING.value,  2, 'PREDICATE_STEP_STRING is 2';
+is SYMBOL_TYPE_REGULAR.value,    0, 'SYMBOL_TYPE_REGULAR is 0';
+is INPUT_ENCODING_UTF8.value,    0, 'INPUT_ENCODING_UTF8 is 0';
+
+# The exception is a plain global class, so its name has no module
+# prefix bolted on — which is what `when X::TreeSitter::Query` in a
+# consumer's CATCH block depends on.
+is X::TreeSitter::Query.^name, 'X::TreeSitter::Query',
+    'the query exception keeps its global name';
+ok X::TreeSitter::Query ~~ Exception,
+    'the query exception is an Exception';
+
+# --- FFI -------------------------------------------------------------
+
+ok TSNodeBuf.^name.chars,   'TSNodeBuf is importable';
+ok TSLanguage.^name.chars,  'TSLanguage is importable';
+ok TSParser.^name.chars,    'TSParser is importable';
+ok TSTree.^name.chars,      'TSTree is importable';
+ok TSQuery.^name.chars,     'TSQuery is importable';
+ok defined(&tsn_node_size), 'the shim entry points are importable';
+
+# --- Languages -------------------------------------------------------
+
+is languages().elems, 9, 'nine grammars are bundled';
+ok defined(&tags-query),       'tags-query is importable';
+ok defined(&highlights-query), 'highlights-query is importable';
+
+# --- Ergonomic layer -------------------------------------------------
+
+is Parser.^name, 'TreeSitter::Native::Parser', 'Parser is exported';
+is Tree.^name,   'TreeSitter::Native::Tree',   'Tree is exported';
+is Node.^name,   'TreeSitter::Native::Node',   'Node is exported';
+
+# Cursor and Point are deliberately NOT exported: Raku's core already
+# binds Cursor, and shadowing it would be a rude thing for a library to
+# do to its importers. They are reachable by full name.
+isnt Cursor.^name, 'TreeSitter::Native::Cursor',
+    "the core's Cursor is not shadowed";
+is TreeSitter::Native::Cursor.^name, 'TreeSitter::Native::Cursor',
+    'our Cursor is reachable by its full name';
+is TreeSitter::Native::Point.^name, 'TreeSitter::Native::Point',
+    'Point is reachable by its full name';
+
+# --- Query -----------------------------------------------------------
+
+is Query.^name, 'TreeSitter::Native::Query', 'Query is exported';
+
+# Same reasoning as Cursor: Raku's Match is far too widely used to
+# shadow.
+isnt Match.^name, 'TreeSitter::Native::Query::Match',
+    "the core's Match is not shadowed";
+is TreeSitter::Native::Query::Match.^name,
+    'TreeSitter::Native::Query::Match',
+    'our Match is reachable by its full name';

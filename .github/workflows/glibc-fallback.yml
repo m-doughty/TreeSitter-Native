@@ -1,0 +1,79 @@
+name: glibc-fallback
+
+# Verifies that Build.rakumod correctly detects a system glibc older
+# than the prebuilt target ($MIN-GLIBC = 2.35, matching ubuntu-22.04)
+# and short-circuits to the source-compile path instead of downloading
+# a prebuilt .so that would fail to load at runtime.
+#
+# GitHub dropped ubuntu-20.04 hosted runners in April 2025, so we use
+# a container on ubuntu-latest instead. The ubuntu:20.04 container
+# ships glibc 2.31 — comfortably below the 2.35 floor.
+#
+# This is also the only lane that exercises the source path on a
+# minimal image: curl and tar are what Build.rakumod uses to fetch and
+# unpack the nine pinned tarballs, and ca-certificates is what lets
+# curl talk to github.com at all. All three are listed explicitly
+# because the base image has none of them.
+
+on:
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
+  pull_request:
+
+jobs:
+  ubuntu-20-04-fallback:
+    name: Ubuntu 20.04 (glibc 2.31) → source fallback
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:20.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      NO_COLOR: '1'
+    steps:
+      - name: Install system deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+              build-essential curl tar ca-certificates git
+          # Sanity-check the glibc version we're about to test against.
+          ldd --version
+
+      - uses: actions/checkout@v6
+
+      - uses: Raku/setup-raku@v1
+        with:
+          raku-version: 'latest'
+
+      - name: Install module (capture build log)
+        id: install
+        run: |
+          set -eo pipefail
+          # `zef install .` runs Build.rakumod; we tee its output so the
+          # subsequent grep can assert the fallback path was taken.
+          zef install --/test --verbose . 2>&1 | tee build.log
+
+      - name: Assert fallback message appeared
+        run: |
+          if ! grep -F 'falling back to source build to avoid runtime loader errors' build.log; then
+              echo "❌ Expected glibc-fallback message not found in build log."
+              echo "---- build.log tail ----"
+              tail -100 build.log
+              exit 1
+          fi
+          echo "✅ Build.rakumod correctly fell back to source compile on old glibc."
+
+      - name: Install App::Prove6
+        run: zef install --/test App::Prove6
+
+      - name: Run tests
+        # Same invocation as test.yml — exercises the full suite against
+        # the source-compiled libtreesitter-native.so, so the fallback
+        # path is validated end-to-end. -I. rather than -Ilib: the tests
+        # read vendored .scm files out of %?RESOURCES.
+        run: prove6 --verbose -I. t

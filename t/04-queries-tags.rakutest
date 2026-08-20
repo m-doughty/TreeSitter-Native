@@ -1,0 +1,463 @@
+use v6.d;
+use Test;
+use TreeSitter::Native;
+use TreeSitter::Native::Types;
+use TreeSitter::Native::Languages;
+use TreeSitter::Native::Query;
+use TreeSitter::Native::Query :INTERNAL;
+
+# Queries against the vendored .scm files, and the predicate evaluation
+# that makes their results correct.
+#
+# The javascript section is the important one: its tags.scm is the only
+# bundled query that filters with predicates, and without evaluating
+# them this binding would report a `constructor` as a method definition
+# and a `require(…)` as a function call. Both halves are asserted
+# against the raw, unfiltered cursor as well, so the test fails if
+# predicate evaluation silently stops happening.
+
+# --- Every vendored query compiles ------------------------------------
+
+for languages() -> Str $lang {
+    for query-kinds($lang) -> Str $kind {
+        # javascript's highlights.scm is the one vendored query that
+        # uses a predicate outside the six this binding evaluates
+        # (#is-not? @x local, an editor property predicate). It needs
+        # :lenient, and that is pinned rather than papered over.
+        my Bool $needs-lenient =
+            $lang eq 'javascript' && $kind eq 'highlights';
+
+        if $needs-lenient {
+            throws-like { Query.new($lang, query-source($lang, $kind)) },
+                X::TreeSitter::Query,
+                kind => QUERY_ERROR_PREDICATE,
+                "$lang/$kind is rejected without :lenient";
+        }
+
+        my $q = Query.new($lang, query-source($lang, $kind),
+                          :lenient($needs-lenient));
+        ok $q.pattern-count > 0,
+            "$lang/$kind compiles ({$q.pattern-count} patterns)";
+        $q.dispose;
+    }
+}
+
+# --- One known definition captured, per grammar -----------------------
+
+my @cases =
+    %( lang => 'c',
+       source => q:to/SRC/,
+           int add(int a, int b) { return helper(a); }
+           SRC
+       capture => 'definition.function', name => 'add' ),
+    %( lang => 'cpp',
+       source => q:to/SRC/,
+           struct Point { int x; };
+           SRC
+       capture => 'definition.class', name => 'Point' ),
+    %( lang => 'python',
+       source => q:to/SRC/,
+           def greet(name):
+               return say_hello(name)
+           SRC
+       capture => 'definition.function', name => 'greet' ),
+    %( lang => 'javascript',
+       source => q:to/SRC/,
+           function greet(name) { return say_hello(name); }
+           SRC
+       capture => 'definition.function', name => 'greet' ),
+    # typescript's tags.scm covers only TypeScript-specific
+    # constructs — signatures, interfaces, abstract classes — so a
+    # plain function would capture nothing at all.
+    %( lang => 'typescript',
+       source => q:to/SRC/,
+           interface Shape {
+               area(): number;
+           }
+           SRC
+       capture => 'definition.interface', name => 'Shape' ),
+    %( lang => 'tsx',
+       source => q:to/SRC/,
+           interface Props {
+               label: string;
+           }
+
+           function App(props: Props) {
+               return <div className="app" />;
+           }
+           SRC
+       capture => 'definition.interface', name => 'Props' ),
+    %( lang => 'go',
+       source => q:to/SRC/,
+           package main
+
+           func greet(name string) string { return sayHello(name) }
+           SRC
+       capture => 'definition.function', name => 'greet' ),
+    %( lang => 'rust',
+       source => q:to/SRC/,
+           fn greet(name: &str) -> &str { say_hello(name) }
+           SRC
+       capture => 'definition.function', name => 'greet' ),
+    %( lang => 'java',
+       source => q:to/SRC/,
+           class Greeter { String greet(String name) { return sayHello(name); } }
+           SRC
+       capture => 'definition.method', name => 'greet' ),
+;
+
+is @cases.map(*<lang>).sort.List, languages(),
+    'every bundled grammar has a tags fixture';
+
+for @cases -> %case {
+    subtest "tags: {%case<lang>}" => {
+        my $parser = Parser.new(%case<lang>);
+        my $tree   = $parser.parse(%case<source>);
+        my $query  = Query.new(%case<lang>, tags-query(%case<lang>));
+
+        my @named = $query.matches($tree.root-node)
+            .grep({ .captures{%case<capture>}.defined })
+            .map({ .captures<name>.defined ?? .captures<name>.text !! '' });
+
+        ok @named.grep(%case<name>).elems,
+            "{%case<capture>} captures {%case<name>}";
+
+        # Every capture name the match reports is one the query
+        # declares — i.e. the capture-id table is being read correctly.
+        my @declared = $query.capture-names;
+        my @seen = $query.captures($tree.root-node).map(*.key).unique;
+        ok @seen.elems, 'the query captured something';
+        is @seen.grep({ !@declared.first($_).defined }).elems, 0,
+            'every capture name came from the query';
+
+        $query.dispose;
+        $tree.dispose;
+        $parser.dispose;
+    };
+}
+
+# --- javascript: predicates actually filter ---------------------------
+
+my $js-source = q:to/SRC/;
+    class Widget {
+        constructor(opts) { this.opts = opts; }
+        render() { return draw(this.opts); }
+    }
+
+    const fs = require('fs');
+
+    function helper(a) { return compute(a); }
+    SRC
+
+my $js-parser = Parser.new('javascript');
+my $js-tree   = $js-parser.parse($js-source);
+my $js-query  = Query.new('javascript', tags-query('javascript'));
+
+sub names-of($match-seq) {
+    my (@defs, @refs);
+    for $match-seq.list -> $m {
+        my %c = $m.captures;
+        my Str $name = %c<name>.defined ?? %c<name>.text !! '?';
+        @defs.push($name) if %c.keys.first(*.starts-with('definition'));
+        @refs.push($name) if %c.keys.first(*.starts-with('reference'));
+    }
+    (@defs.unique.sort.List, @refs.unique.sort.List);
+}
+
+my ($defs, $refs) = names-of($js-query.matches($js-tree.root-node));
+
+# The evidence that #not-eq? ran.
+ok  $defs.first('render'),  'render is reported as a definition';
+ok  $defs.first('helper'),  'helper is reported as a definition';
+ok  $defs.first('Widget'),  'Widget is reported as a definition';
+nok $defs.first('constructor'),
+    'constructor is FILTERED OUT by (#not-eq? @name "constructor")';
+
+# The evidence that #not-match? ran.
+ok  $refs.first('draw'),    'draw is reported as a reference';
+ok  $refs.first('compute'), 'compute is reported as a reference';
+nok $refs.first('require'),
+    'require is FILTERED OUT by (#not-match? @name "^(require)$")';
+
+# …and the control: the same query, same tree, with the predicates NOT
+# applied, does report both. Without this the two `nok`s above would
+# also pass if the query simply stopped matching anything.
+my @raw-matches;
+my $cursor = $js-query.cursor($js-tree.root-node);
+while $cursor.next-match -> $m { @raw-matches.push($m) }
+$cursor.dispose;
+
+my ($raw-defs, $raw-refs) = names-of(@raw-matches);
+ok $raw-defs.first('constructor'),
+    'the unfiltered cursor DOES see constructor';
+ok $raw-refs.first('require'),
+    'the unfiltered cursor DOES see require';
+ok @raw-matches.elems > $js-query.matches($js-tree.root-node).elems,
+    'so filtering really removed matches';
+
+# accepts() is the filter, and is public for hand-driven loops.
+my $rejected = @raw-matches.first({
+    my %c = .captures;
+    %c<name>.defined && %c<name>.text eq 'constructor';
+});
+ok $rejected.defined, 'found the constructor match';
+nok $js-query.accepts($rejected), 'and the query rejects it';
+
+# --- Predicates and directives are exposed structurally ---------------
+
+my $method-pattern = (^$js-query.pattern-count).first({
+    $js-query.pattern-predicates($_)
+        .first({ .name eq 'not-eq?' }).defined;
+});
+ok $method-pattern.defined, 'found the pattern carrying #not-eq?';
+
+my @clauses = $js-query.pattern-predicates($method-pattern);
+my $not-eq = @clauses.first({ .name eq 'not-eq?' });
+is $not-eq.args.elems, 2, '#not-eq? has two arguments';
+is $not-eq.args[0].kind, PREDICATE_STEP_CAPTURE, 'a capture';
+is $not-eq.args[0].value, 'name', 'named `name`';
+is $not-eq.args[1].kind, PREDICATE_STEP_STRING, 'and a string';
+is $not-eq.args[1].value, 'constructor', 'which is "constructor"';
+ok $not-eq.evaluated, 'and it is evaluated';
+nok $not-eq.is-directive, 'it is not a directive';
+is $not-eq.Str, '(#not-eq? @name "constructor")',
+    'predicates stringify back to something query-shaped';
+
+my @directives = $js-query.pattern-directives($method-pattern);
+ok @directives.elems >= 2, 'the same pattern carries directives';
+ok @directives.first({ .name eq 'strip!' }).defined,
+    '#strip! is exposed';
+ok @directives.first({ .name eq 'select-adjacent!' }).defined,
+    '#select-adjacent! is exposed';
+ok @directives.all.is-directive, 'all of them are directives';
+nok @directives.first({ .evaluated }).defined,
+    'and none of them is evaluated — directives are exposed, not applied';
+
+# --- The remaining four predicates ------------------------------------
+
+my $py-parser = Parser.new('python');
+my $py-tree   = $py-parser.parse(q:to/SRC/);
+    x = x
+    y = z
+    foo(1)
+    bar(2)
+    SRC
+my $py-root = $py-tree.root-node;
+
+sub texts($query, Str $capture) {
+    $query.matches($py-root).map({ .captures{$capture}.text }).sort.List;
+}
+
+is texts(Query.new('python', '((assignment left: (identifier) @l
+                               right: (identifier) @r) (#eq? @l @r))'),
+         'l'),
+   ('x',), '#eq? compares two captures pairwise';
+
+is texts(Query.new('python', '((assignment left: (identifier) @l
+                               right: (identifier) @r) (#not-eq? @l @r))'),
+         'l'),
+   ('y',), '#not-eq? negates it';
+
+is texts(Query.new('python', '((call function: (identifier) @f)
+                               (#eq? @f "foo"))'), 'f'),
+   ('foo',), '#eq? compares a capture against a literal';
+
+is texts(Query.new('python', '((call function: (identifier) @f)
+                               (#any-of? @f "foo" "baz"))'), 'f'),
+   ('foo',), '#any-of? matches a set membership';
+
+is texts(Query.new('python', '((call function: (identifier) @f)
+                               (#not-any-of? @f "foo" "baz"))'), 'f'),
+   ('bar',), '#not-any-of? negates it';
+
+is texts(Query.new('python', '((call function: (identifier) @f)
+                               (#match? @f "^f"))'), 'f'),
+   ('foo',), '#match? applies a regex';
+
+is texts(Query.new('python', '((call function: (identifier) @f)
+                               (#not-match? @f "^f"))'), 'f'),
+   ('bar',), '#not-match? negates it';
+
+# A capture the match does not contain has no nodes, and a predicate
+# over no nodes is vacuously true — tree-sitter's own rule. `(string)?`
+# is how a pattern gets a capture that some matches simply do not have.
+my $vacuous-tree = $py-parser.parse(q:to/SRC/);
+    foo(1)
+    bar('q')
+    baz('other')
+    SRC
+is Query.new('python', q:to/Q/).matches($vacuous-tree.root-node)
+        ((call function: (identifier) @f
+               arguments: (argument_list (string)? @s))
+         (#eq? @s "'q'"))
+        Q
+       .map({ .captures<f>.text }).sort.List,
+   ('bar', 'foo'),
+   'a predicate over a capture the match lacks is vacuously true';
+
+# tree-sitter itself rejects a predicate naming a capture the pattern
+# never declares, before this module gets a chance to.
+throws-like { Query.new('python', '((call) @c (#eq? @absent "x"))') },
+    X::TreeSitter::Query,
+    kind => QUERY_ERROR_CAPTURE,
+    'a predicate on an undeclared capture is a query error';
+
+# --- Query introspection ----------------------------------------------
+
+my $intro = Query.new('python',
+    '(function_definition name: (identifier) @fn) (call) @call');
+is $intro.pattern-count, 2, 'pattern-count';
+is $intro.capture-count, 2, 'capture-count';
+is $intro.capture-names.sort.List, ('call', 'fn'), 'capture-names';
+is $intro.capture-name(0), 'fn', 'capture-name by id';
+nok $intro.capture-name(99).defined, 'and out of range is undefined';
+is $intro.start-byte-for-pattern(0), 0, 'pattern 0 starts at byte 0';
+ok $intro.start-byte-for-pattern(1) > 0, 'pattern 1 starts later';
+is $intro.pattern-predicates(0).elems, 0, 'neither pattern has predicates';
+ok $intro.gist.contains('2 patterns'), 'gist counts patterns';
+
+# --- Byte-range restriction -------------------------------------------
+
+my $ids = Query.new('python', '(identifier) @id');
+is $ids.captures($py-root).map({ .value.text }).List,
+   <x x y z foo bar>,
+   'unrestricted, every identifier is captured in source order';
+
+my UInt $foo-at = $py-tree.source.index('foo');
+is $ids.captures($py-root, :start-byte($foo-at),
+                           :end-byte($foo-at + 3))
+       .map({ .value.text }).List,
+   ('foo',),
+   'a byte range restricts matching to that span';
+
+is $ids.captures($py-root, :start-byte(0), :end-byte(1))
+       .map({ .value.text }).List,
+   ('x',), 'a one-byte range catches only what starts in it';
+
+# An empty range means nothing, and is handled on the Raku side:
+# tree-sitter reads an end byte of 0 as "no limit", so passing 0..0
+# straight through would return the whole file instead.
+is $ids.captures($py-root, :start-byte(0), :end-byte(0)).elems,
+   0, 'an empty range at byte 0 matches nothing';
+is $ids.captures($py-root, :start-byte(4), :end-byte(4)).elems,
+   0, 'and so does an empty range anywhere else';
+
+throws-like { $ids.cursor($py-root, :start-byte(10), :end-byte(2)) },
+    Exception, message => /'byte range'/,
+    'an inside-out byte range is rejected';
+
+# --- Match accessors ---------------------------------------------------
+
+my $doc-query = Query.new('javascript', tags-query('javascript'));
+my $doc-tree  = Parser.new('javascript').parse(q:to/SRC/);
+    // one
+    // two
+    function documented() {}
+    SRC
+
+my $doc-match = $doc-query.matches($doc-tree.root-node)
+    .first({ .nodes('doc').elems > 1 });
+ok $doc-match.defined, 'a (comment)* capture yields several @doc nodes';
+is $doc-match.nodes('doc').elems, 2, '.nodes returns all of them';
+is $doc-match.captures<doc>.text, '// one',
+    '.captures keeps the first';
+is $doc-match.node('doc').text, '// one', '.node is the same shortcut';
+is $doc-match.nodes('no-such-capture').elems, 0,
+    '.nodes on an absent capture is empty';
+nok $doc-match.node('no-such-capture').defined,
+    '.node on an absent capture is undefined';
+ok $doc-match.entries.elems >= 3, '.entries keeps every capture';
+ok $doc-match.directives.elems, '.directives reaches the query';
+ok $doc-match.predicates.elems, '.predicates reaches the query';
+ok $doc-match.gist.contains('pattern'), 'matches have a useful gist';
+
+# Same type-object contract as the ergonomic layer: .gist, .Str and
+# .raku must not read attributes that a type object does not have.
+lives-ok { TreeSitter::Native::Query.gist },
+    'Query.gist on the type object is safe';
+lives-ok { TreeSitter::Native::Query.raku },
+    'Query.raku on the type object is safe';
+lives-ok { TreeSitter::Native::Query::Match.gist },
+    'Match.gist on the type object is safe';
+lives-ok { TreeSitter::Native::Query::Predicate.gist },
+    'Predicate.gist on the type object is safe';
+lives-ok { quietly TreeSitter::Native::Query::Arg.Str },
+    'Arg.Str on the type object warns rather than dying';
+
+# --- The regex translator ----------------------------------------------
+#
+# #match? patterns are Perl-flavoured; Raku's regex engine is not, and
+# there is no runtime "compile this string as a P5 regex" short of EVAL
+# (which would execute anything a .scm file cared to embed). They are
+# translated instead — so the translation is pinned here.
+
+is p5-to-raku('^(require)$'), Q{^('require')$},
+    'anchors and a capture group';
+is p5-to-raku('^[\s\*/]+'), Q{^<[\s\*\/]>+},
+    'a character class becomes a Raku character class, not a group';
+is p5-to-raku('a{2,3}'), Q{'a' ** 2..3},
+    'a brace quantifier becomes **, not a code block';
+is p5-to-raku('a{2,}'), Q{'a' ** 2..*}, 'open-ended repetition';
+is p5-to-raku('a{2}'), Q{'a' ** 2}, 'exact repetition';
+is p5-to-raku('abc*'), Q{'ab''c'*},
+    'a quantifier binds to the last character, not the whole run';
+is p5-to-raku('foo|bar'), Q{'foo'||'bar'},
+    'alternation becomes || (left to right, as Perl means it)';
+is p5-to-raku('a.c'), Q{'a'\N'c'},
+    'dot becomes \N, which excludes newline as Perl does';
+is p5-to-raku('[^a-z_]+'), Q{<-[a..z\_]>+}, 'negation and ranges';
+is p5-to-raku('(?:ab)+'), Q{['ab']+}, 'a non-capturing group';
+is p5-to-raku('\bword\b'), Q{<|w>'word'<|w>}, 'word boundaries';
+is p5-to-raku('(?i)abc'), Q{:i 'abc'}, 'the case-insensitivity flag';
+is p5-to-raku('\x41'), Q{\x[41]}, 'a hex escape';
+is p5-to-raku(Q{\x{263A}}), Q{\x[263A]}, 'a braced hex escape';
+is p5-to-raku('a+?'), Q{'a'+?}, 'a lazy quantifier';
+is p5-to-raku('{notaquant}'), Q{'{notaquant}'},
+    'a brace that is not a quantifier stays a literal';
+is p5-to-raku(''), Q{''}, 'the empty pattern';
+is p5-to-raku(Q{it's}), Q{'it\'s'}, 'a quote in a literal is escaped';
+is p5-to-raku(Q{a\\b}), Q{'a\\b'}, 'and so is a backslash';
+is p5-to-raku('(?=x)'), Q{<?before 'x'>}, 'lookahead';
+is p5-to-raku('(?!x)'), Q{<!before 'x'>}, 'negative lookahead';
+is p5-to-raku('(?<=x)'), Q{<?after 'x'>}, 'lookbehind';
+is p5-to-raku(Q{(?<n>a)}), Q{$<n>=['a']}, 'a named group';
+
+# The translations are not just string-equal, they behave.
+sub matches(Str $p5, Str $subject --> Bool) {
+    my $rx = p5-to-raku($p5);
+    so ($subject ~~ /<$rx>/);
+}
+ok  matches('^(require)$', 'require'), 'the require pattern matches';
+nok matches('^(require)$', 'required'), 'and is anchored at both ends';
+ok  matches(Q{^[\s\*/]+}, ' * doc'), 'the strip pattern matches';
+nok matches(Q{^[\s\*/]+}, 'doc'), 'and only at the start';
+ok  matches('a{2,3}', 'aa'), 'brace quantifiers count';
+nok matches('^a{2,3}$', 'a'), 'and enforce their minimum';
+ok  matches('(?i)ABC', 'abc'), 'case insensitivity applies';
+
+# Anything it cannot translate faithfully is an error, not a guess.
+for (Q{a\1}       => 'backreferences',
+     '(?#comment)' => 'unsupported (?…) group',
+     '[a'          => 'unterminated character class',
+     '(a'          => 'unbalanced (',
+     'a)'          => 'unbalanced )',
+     '[[:alpha:]]' => 'POSIX bracket classes',
+     '*'           => 'nothing for',
+     'a*+'         => 'possessive',
+     Q{a\}         => 'trailing backslash',
+     Q{\q}         => 'is not supported',
+    ) -> (:key($bad), :value($reason)) {
+    throws-like { p5-to-raku($bad) }, Exception,
+        message => /$reason/,
+        "p5-to-raku rejects /$bad/";
+}
+
+# A #match? whose pattern cannot be translated is a query error, with
+# the offset of the pattern that carries it.
+throws-like {
+    Query.new('python', '((identifier) @a (#match? @a "(?#nope)"))')
+}, X::TreeSitter::Query,
+    kind => QUERY_ERROR_PREDICATE,
+    'an untranslatable #match? pattern fails at query construction';
+
+done-testing;

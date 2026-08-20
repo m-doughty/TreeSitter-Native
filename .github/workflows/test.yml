@@ -1,0 +1,184 @@
+name: test
+
+# Both install paths, on all three desktop OSes:
+#
+#   1. prebuilt — `zef install .` downloads the artefact for this
+#      platform from the release named in BINARY_TAG, SHA-verifies it
+#      against resources/checksums.txt, stages it. Until that release
+#      exists, Build.rakumod falls back to compiling, which is why the
+#      C toolchain is set up before the FIRST install rather than
+#      between the two.
+#   2. source — TREESITTER_NATIVE_BUILD_FROM_SOURCE=1 forces the
+#      compile: nine pinned tarballs, 17 translation units, one link.
+#
+# The pinned tarballs are prefetched into a cache keyed on SOURCE_PINS
+# so a rerun does not re-download ~56MB of generated C.
+
+on:
+  push:
+    branches:
+      - '*'
+    tags-ignore:
+      - '*'
+  pull_request:
+
+jobs:
+  raku:
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+        raku-version:
+          - 'latest'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: Raku/setup-raku@v1
+        with:
+          raku-version: ${{ matrix.raku-version }}
+
+      # ---------------------------------------------------------
+      # C toolchain. On Unix `cc` is pre-installed on every runner;
+      # on Windows the VS Dev Environment provides cl.exe. This runs
+      # before the first install on purpose: the prebuilt path falls
+      # back to compiling whenever the BINARY_TAG release is missing
+      # an artefact, and a fallback that cannot find cl.exe would
+      # fail the workflow for the wrong reason.
+      # ---------------------------------------------------------
+      - name: Setup VS Dev Environment
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found at $vswhere" }
+
+          $installPath = & $vswhere -nologo -latest -products * `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+          if (-not $installPath) { throw 'No VS installation with VC.Tools.x86.x64 found' }
+          Write-Host "VS install: $installPath"
+
+          $vsdevcmd = Join-Path $installPath 'Common7\Tools\vsdevcmd.bat'
+          if (-not (Test-Path $vsdevcmd)) { throw "vsdevcmd.bat not found at $vsdevcmd" }
+
+          $arch = $env:PROCESSOR_ARCHITECTURE.ToLower()
+          $before = @{}
+          Get-ChildItem env: | ForEach-Object { $before[$_.Name] = $_.Value }
+
+          $lines = & cmd /c "`"$vsdevcmd`" -no_logo -host_arch=$arch -arch=$arch && set"
+          if ($LASTEXITCODE -ne 0) { throw "vsdevcmd failed (exit $LASTEXITCODE)" }
+
+          foreach ($line in $lines) {
+              if ($line -notmatch '^([^=]+)=(.*)$') { continue }
+              $name  = $Matches[1]
+              $value = $Matches[2]
+              if ($before.ContainsKey($name) -and $before[$name] -eq $value) { continue }
+              Add-Content -Path $env:GITHUB_ENV -Value "$name=$value"
+          }
+
+      # ---------------------------------------------------------
+      # Source cache. Kept OUTSIDE the workspace so `zef install .`
+      # doesn't stage 56MB of tarballs along with the dist, and
+      # exported as a native path (cygpath -m on Windows) because
+      # Build.rakumod hands the value straight to IO::Path.
+      # ---------------------------------------------------------
+      - name: Configure source cache dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            dir="$(cygpath -m "$RUNNER_TEMP")/ts-native-cache"
+          else
+            dir="$RUNNER_TEMP/ts-native-cache"
+          fi
+          echo "TREESITTER_NATIVE_CACHE_DIR=$dir" >> "$GITHUB_ENV"
+
+      # restore + save SPLIT rather than actions/cache@v4: save runs
+      # immediately after the prefetch, so a later compile or test
+      # failure still leaves the downloads cached for the rerun.
+      - name: Restore pinned sources
+        id: source-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.TREESITTER_NATIVE_CACHE_DIR }}/TreeSitter-Native-source
+          key: ts-sources-${{ runner.os }}-${{ hashFiles('SOURCE_PINS') }}
+
+      - name: Prefetch pinned sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dest="$TREESITTER_NATIVE_CACHE_DIR"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            dest="$(cygpath -u "$dest")"
+          fi
+          dest="$dest/TreeSitter-Native-source"
+          mkdir -p "$dest"
+
+          sha_of() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1" | cut -d' ' -f1
+            else
+              shasum -a 256 "$1" | cut -d' ' -f1
+            fi
+          }
+
+          # Same file, same digests, same filenames Build.rakumod
+          # expects: <cache>/TreeSitter-Native-source/<name>-<tag>.tar.gz.
+          grep -v '^[[:space:]]*#' SOURCE_PINS | grep -v '^[[:space:]]*$' |
+          while read -r name tag sha url; do
+            out="$dest/$name-$tag.tar.gz"
+            if [ -f "$out" ] && [ "$(sha_of "$out")" = "$sha" ]; then
+              echo "cached   $name $tag"
+              continue
+            fi
+            rm -f "$out"
+            echo "fetching $name $tag"
+            curl -fL --retry 3 --retry-delay 5 --silent --show-error \
+                 -o "$out" "$url"
+            got="$(sha_of "$out")"
+            if [ "$got" != "$sha" ]; then
+              echo "SHA-256 mismatch for $name $tag" >&2
+              echo "  expected $sha" >&2
+              echo "  got      $got" >&2
+              rm -f "$out"
+              exit 1
+            fi
+          done
+
+      - name: Save pinned sources
+        if: steps.source-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.TREESITTER_NATIVE_CACHE_DIR }}/TreeSitter-Native-source
+          key: ts-sources-${{ runner.os }}-${{ hashFiles('SOURCE_PINS') }}
+
+      # ---------------------------------------------------------
+      # Pass 1 — prebuilt path (the end-user install).
+      # ---------------------------------------------------------
+      - name: Install TreeSitter::Native via prebuilt path
+        run: zef install --/test .
+
+      - name: Install App::Prove6
+        run: zef install --/test App::Prove6
+
+      # -I. rather than -Ilib: the tests read vendored .scm files out
+      # of %?RESOURCES, which wants the distribution root.
+      - name: Run tests — prebuilt path
+        run: prove6 --verbose -I. t
+
+      # ---------------------------------------------------------
+      # Pass 2 — source path (nine tarballs, 17 TUs, one link).
+      # ---------------------------------------------------------
+      - name: Install TreeSitter::Native via source-build path
+        env:
+          TREESITTER_NATIVE_BUILD_FROM_SOURCE: '1'
+        run: zef install --/test --force-install .
+
+      - name: Run tests — source-build path
+        run: prove6 --verbose -I. t

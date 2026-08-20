@@ -1,0 +1,42 @@
+.precomp
+lib/.precomp
+*.o
+*.obj
+*.a
+*.lib
+*.exp
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.pdb
+.DS_Store
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+*.old
+*.log
+core
+*.core
+
+# Downloaded prebuilt packs unpacked in place.
+TreeSitter-Native-*
+
+# Per-TU object files and the link scratch area created by
+# Build.rakumod's source path (17 translation units, so this gets
+# noisy — it lives entirely under build/).
+build/
+
+# The staged native library. Built or downloaded at install time,
+# never committed: it is 15-25MB per platform and platform-specific.
+resources/lib/libtreesitter-native.*
+
+# Windows redirection artifact if the Windows compiler probe ever
+# runs on a Unix box.
+nul

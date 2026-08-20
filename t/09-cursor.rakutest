@@ -1,0 +1,247 @@
+use v6.d;
+use Test;
+use TreeSitter::Native;
+use TreeSitter::Native::Languages;
+
+# The tree cursor.
+#
+# Its reason to exist is walking a whole file without allocating a Node
+# per step, so the central claim to pin is that it visits exactly the
+# same nodes, in exactly the same order, as the recursive child walk it
+# replaces. That is checked node-for-node — by identity, not by type —
+# for every bundled grammar.
+
+my %fixtures =
+    c          => q:to/SRC/,
+        int add(int a, int b) {
+            int sum = a + b;
+            return sum;
+        }
+        SRC
+    cpp        => q:to/SRC/,
+        struct Point {
+            int x;
+            int y() const { return x; }
+        };
+        SRC
+    python     => q:to/SRC/,
+        class Greeter:
+            def greet(self, name):
+                return say_hello(name)
+        SRC
+    javascript => q:to/SRC/,
+        class Widget {
+            render() { return draw(this.opts); }
+        }
+        SRC
+    typescript => q:to/SRC/,
+        interface Shape { area(): number; }
+
+        function size(s: Shape): number { return s.area(); }
+        SRC
+    tsx        => q:to/SRC/,
+        function App(props: { label: string }) {
+            return <div className="app">{props.label}</div>;
+        }
+        SRC
+    go         => q:to/SRC/,
+        package main
+
+        func greet(name string) string {
+            return sayHello(name)
+        }
+        SRC
+    rust       => q:to/SRC/,
+        fn greet(name: &str) -> String {
+            format!("hello {}", name)
+        }
+        SRC
+    java       => q:to/SRC/,
+        class Greeter {
+            String greet(String name) { return sayHello(name); }
+        }
+        SRC
+;
+
+is %fixtures.keys.sort.List, languages(),
+    'every bundled grammar has a cursor fixture';
+
+for %fixtures.keys.sort -> Str $lang {
+    subtest "cursor walk equals recursive walk: $lang" => {
+        my $parser = Parser.new($lang);
+        my $tree   = $parser.parse(%fixtures{$lang});
+        my $root   = $tree.root-node;
+        nok $root.has-error, 'the fixture parses cleanly';
+
+        my @recursive = $root.walk.eager;
+        ok @recursive.elems > 10, "the tree has {@recursive.elems} nodes";
+
+        my $cursor = $tree.cursor;
+        my @cursored = $cursor.walk.eager;
+        $cursor.dispose;
+
+        is @cursored.elems, @recursive.elems,
+            'both walks visit the same number of nodes';
+
+        # Node for node, by identity — not merely the same types in the
+        # same order, but the same nodes.
+        my Int $mismatch = -1;
+        for ^@recursive.elems -> Int $i {
+            if @cursored[$i] !=== @recursive[$i] {
+                $mismatch = $i;
+                last;
+            }
+        }
+        is $mismatch, -1,
+            'and the same node at every position';
+
+        is @cursored.map(*.type).List, @recursive.map(*.type).List,
+            'which also means the same types in the same order';
+
+        $tree.dispose;
+        $parser.dispose;
+    };
+}
+
+# --- Cursor mechanics -------------------------------------------------
+
+my $parser = Parser.new('python');
+my $tree = $parser.parse(q:to/SRC/);
+    def greet(name):
+        return name
+    SRC
+my $root = $tree.root-node;
+my $cursor = $tree.cursor;
+
+# Depth is relative to where the cursor started, not to the tree.
+is $cursor.current-depth, 0, 'the cursor starts at depth 0';
+is $cursor.current-node.type, 'module', 'on the node it was made from';
+nok $cursor.current-field-name.defined, 'the root fills no field';
+
+ok $cursor.goto-first-child, 'descending succeeds';
+is $cursor.current-depth, 1, 'and increments the depth';
+is $cursor.current-node.type, 'function_definition', 'onto the child';
+
+ok $cursor.goto-first-child, 'descending again succeeds';
+is $cursor.current-node.type, 'def', 'onto the `def` keyword';
+nok $cursor.current-field-name.defined, 'which fills no field';
+
+ok $cursor.goto-next-sibling, 'moving sideways succeeds';
+is $cursor.current-node.type, 'identifier', 'onto the name';
+is $cursor.current-field-name, 'name', 'which fills the name field';
+is $cursor.current-depth, 2, 'still at depth 2';
+
+ok $cursor.goto-parent, 'climbing succeeds';
+is $cursor.current-node.type, 'function_definition', 'back to the parent';
+is $cursor.current-depth, 1, 'and back to depth 1';
+
+ok $cursor.goto-parent, 'climbing to the starting node succeeds';
+is $cursor.current-depth, 0, 'which is depth 0';
+nok $cursor.goto-parent,
+    'and the cursor refuses to climb above where it started';
+is $cursor.current-node.type, 'module',
+    'staying put when it refuses';
+nok $cursor.goto-next-sibling,
+    'the root has no sibling to move to';
+
+# A leaf has nowhere to descend to.
+$cursor.goto-first-child;
+$cursor.goto-first-child;
+nok $cursor.goto-first-child, 'a leaf has no first child';
+is $cursor.current-node.type, 'def',
+    'and the cursor did not move';
+
+# --- reset ------------------------------------------------------------
+
+my $def = $root.named-child(0);
+$cursor.reset($def);
+is $cursor.current-node.type, 'function_definition',
+    'reset re-aims the cursor';
+is $cursor.current-depth, 0, 'and its new node becomes depth 0';
+nok $cursor.goto-parent,
+    'so it will not climb out of the new subtree';
+
+# A walk from a reset cursor covers that subtree and nothing else.
+$cursor.reset($def);
+my @sub = $cursor.walk.eager;
+is @sub.elems, $def.walk.elems,
+    'a walk from a reset cursor covers exactly that subtree';
+is @sub.head, $def, 'starting at the node it was reset to';
+ok @sub.grep({ $_ === $root }).elems == 0,
+    'and never reaching the root above it';
+
+$cursor.dispose;
+
+# --- Cursors from nodes -----------------------------------------------
+
+my $node-cursor = $def.cursor;
+is $node-cursor.current-node, $def, 'Node.cursor starts on that node';
+is $node-cursor.tree, $tree, 'and knows its tree';
+is $node-cursor.walk.elems, $def.walk.elems,
+    'walking from it covers the same subtree';
+$node-cursor.dispose;
+
+# A cursor on a leaf walks exactly one node.
+my $leaf = $root.walk.first({ .child-count == 0 });
+ok $leaf.defined, 'the tree has a leaf';
+my $leaf-cursor = $leaf.cursor;
+is $leaf-cursor.walk.eager.List, ($leaf,),
+    'a walk from a leaf yields just that leaf';
+$leaf-cursor.dispose;
+
+# --- named-walk -------------------------------------------------------
+
+my @named = $root.named-walk.eager;
+ok @named.elems, 'named-walk yields nodes';
+ok @named.all.is-named, 'all of which are named';
+ok @named.elems < $root.walk.elems,
+    'and there are fewer of them than of all nodes';
+is @named.head, $root, 'starting from the node itself';
+
+# --- Walking a big-ish file stays consistent --------------------------
+#
+# Deep and wide enough that the climb-and-advance logic has to work at
+# several levels at once, which a three-node fixture would not exercise.
+
+# Concatenated, not interpolated: "fn$_(a, b)" would parse the
+# parentheses as a call on $_.
+my $big-source = (^40).map(-> Int $i {
+    'def fn' ~ $i ~ "(a, b):\n"
+    ~ "    if a:\n"
+    ~ '        return helper' ~ $i ~ "(a, b)\n"
+    ~ "    return b\n"
+}).join("\n");
+my $big-tree = $parser.parse($big-source);
+my @big-recursive = $big-tree.root-node.walk.eager;
+my $big-cursor = $big-tree.cursor;
+my @big-cursored = $big-cursor.walk.eager;
+$big-cursor.dispose;
+
+ok @big-recursive.elems > 500,
+    "the big fixture has {@big-recursive.elems} nodes";
+is @big-cursored.elems, @big-recursive.elems,
+    'both walks agree on the count';
+is (^@big-recursive.elems).grep({
+       @big-cursored[$_] !=== @big-recursive[$_]
+   }).elems,
+   0,
+   'and on every single node';
+
+# Depths reported during a walk never exceed the tree's actual depth.
+my $depth-cursor = $big-tree.cursor;
+my Int $max-depth = 0;
+my Int $steps = 0;
+for $depth-cursor.walk {
+    $max-depth = $depth-cursor.current-depth
+        if $depth-cursor.current-depth > $max-depth;
+    $steps++;
+}
+$depth-cursor.dispose;
+is $steps, @big-recursive.elems, 'the walk visited every node';
+ok $max-depth > 3, 'and reached a sensible depth';
+
+$big-tree.dispose;
+$tree.dispose;
+$parser.dispose;
+
+done-testing;
