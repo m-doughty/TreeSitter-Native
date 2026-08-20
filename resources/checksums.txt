@@ -19,8 +19,8 @@
 # slower: the source path fetches nine tarballs and compiles 17
 # translation units).
 
-0a7f912cbe3dfe088b81e76314173dcf4cac923ba218057ef0387c6c55e0e9a4  libtreesitter-native-linux-aarch64-glibc.so
-506aac82636da146a32187fc267bd9791a11cf3fcd92d8ec42f4723a8d996eeb  libtreesitter-native-windows-x86_64.dll
+42c5c994bf9a1ddb1d73e691cf43033efaf39debe1007d4dce193859998fb7ab  libtreesitter-native-windows-arm64.dll
+56b29c686d9e5976ac893520ff79364b2e1d7fbb32a8245c5269682738dadf4d  libtreesitter-native-linux-aarch64-glibc.so
 969d7ae2bf93ae347977613fbb3cdedf005c119ceb184e4637a420f44c8230a7  libtreesitter-native-macos-universal.dylib
-9942f54e452eb88b36e6a749f7dc40e6f3dd6f95f4d9feaee80a4185c3b1f53b  libtreesitter-native-windows-arm64.dll
-d9d11bb380a3aba1fdd9389abf67ffd992251cebeed6991a42f6b782910ecc7a  libtreesitter-native-linux-x86_64-glibc.so
+9d9cae10ed20ea6dde8bf590cc02ddc035c49d64f5197e6a2bd4d81dc8e112e0  libtreesitter-native-linux-x86_64-glibc.so
+dc35a844102debfddde794c0f5550d3743ba518a9b01f3449ba02642c48d33b1  libtreesitter-native-windows-x86_64.dll
