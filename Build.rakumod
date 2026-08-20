@@ -486,6 +486,45 @@ class Build {
         %trees;
     }
 
+    #| The argv prefix for a tar that can cope with the paths we hand
+    #| it. Unix is just `tar`; Windows is where this earns its keep.
+    #|
+    #| GNU tar reads an argument like `D:/a/_temp/ts-native-cache/x.tar.gz`
+    #| as a REMOTE archive spec — `host:path` — and tries to rsh to a
+    #| machine called `D`, dying with "Cannot connect to D: resolve
+    #| failed" before it reads a byte. Every absolute path on Windows
+    #| starts with a drive letter, so this is not an edge case: on a
+    #| GitHub Windows runner bare `tar` resolves to Git Bash's GNU tar
+    #| and extraction fails 100% of the time.
+    #|
+    #| So on Windows, prefer the bsdtar that ships in
+    #| %SystemRoot%\System32 on every Windows 10 1803+ — by ABSOLUTE
+    #| path, so PATH order can't put GNU tar back in front of it. It
+    #| understands drive letters natively and supports both -xzf and
+    #| --strip-components (it is the same libarchive tar macOS uses,
+    #| where this exact argv has always worked).
+    #|
+    #| Only if that binary is absent do we fall back to whatever `tar`
+    #| is on PATH with `--force-local` prepended — GNU tar's escape
+    #| hatch meaning "that colon is a drive letter, not a host". The
+    #| ladder is this way round and not the other because bsdtar
+    #| REJECTS --force-local, so the flag is usable only on the
+    #| fallback leg, while System32 bsdtar is deterministic on any
+    #| supported Windows.
+    method !tar-argv(--> List) {
+        return ('tar',) unless $*DISTRO.is-win;
+
+        # %*ENV lookups are case-sensitive and Windows' own spelling of
+        # this one varies by how the process was launched, so try each
+        # before falling back to the documented default location.
+        my Str $root = %*ENV<SystemRoot> // %*ENV<SYSTEMROOT>
+                    // %*ENV<systemroot> // 'C:\\Windows';
+        my IO::Path $bsdtar = $root.IO.add('System32').add('tar.exe');
+        return ($bsdtar.absolute,) if $bsdtar.f;
+
+        ('tar', '--force-local');
+    }
+
     #| curl and tar have to exist before the first download, not after
     #| it. Both ship with Windows 10 1803+ (bsdtar) and with every Unix
     #| we target, but minimal containers do sometimes omit them, and the
@@ -495,21 +534,28 @@ class Build {
     #| TREESITTER_NATIVE_VENDOR_DIR install is expected to work on a
     #| machine that has neither.
     method !check-fetch-tools() {
-        for <curl tar> -> Str $tool {
-            my $proc = try run $tool, '--version', :out, :err;
-            my Bool $ok = False;
-            with $proc {
-                .out.slurp(:close);
-                .err.slurp(:close);
-                $ok = .exitcode == 0;
-            }
-            unless $ok {
-                die "❌ `$tool` is required for the source build (it "
-                  ~ "downloads and unpacks the pinned tree-sitter "
-                  ~ "sources) but could not be run. Install it, or set "
-                  ~ "TREESITTER_NATIVE_VENDOR_DIR to a directory of "
-                  ~ "pre-staged source trees.";
-            }
+        # Probe the tar we will actually invoke, not a bare `tar` that
+        # may be a different binary from the one !ensure-one-source
+        # picks — see !tar-argv.
+        self!check-fetch-tool('curl', ('curl', '--version'));
+        self!check-fetch-tool('tar',  (|self!tar-argv, '--version'));
+    }
+
+    method !check-fetch-tool(Str $name, @argv) {
+        my $proc = try run |@argv, :out, :err;
+        my Bool $ok = False;
+        with $proc {
+            .out.slurp(:close);
+            .err.slurp(:close);
+            $ok = .exitcode == 0;
+        }
+        unless $ok {
+            die "❌ `$name` is required for the source build (it "
+              ~ "downloads and unpacks the pinned tree-sitter "
+              ~ "sources) but could not be run as "
+              ~ "`{ @argv.join(' ') }`. Install it, or set "
+              ~ "TREESITTER_NATIVE_VENDOR_DIR to a directory of "
+              ~ "pre-staged source trees.";
         }
     }
 
@@ -588,12 +634,17 @@ class Build {
         # the directory name than parse GitHub's.
         $tree.mkdir;
         say "  Extracting $stem…";
-        my $tar = run 'tar', '-xzf', $tarball.Str,
+        # NOT a bare `tar`: on Windows that is Git Bash's GNU tar, which
+        # would read the drive letter in $tarball as a remote host. See
+        # !tar-argv.
+        my @tar = self!tar-argv;
+        my $tar = run |@tar, '-xzf', $tarball.Str,
                       '--strip-components=1', '-C', $tree.Str, :err;
         my Str $tar-err = $tar.err.slurp(:close);
         unless $tar.exitcode == 0 {
             self!rm-rf($tree);
-            die "❌ Failed to extract $stem.tar.gz:\n$tar-err";
+            die "❌ Failed to extract $stem.tar.gz using "
+              ~ "`{ @tar.join(' ') }`:\n$tar-err";
         }
 
         self!verify-source-tree(%pin<name>, $tree);
