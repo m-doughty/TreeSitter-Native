@@ -853,9 +853,23 @@ class Build {
             # it the DLL would export only what __declspec(dllexport)
             # marked, which is the same set, but the .def is what keeps
             # the two in provable agreement.
-            @link = 'link', '/nologo', '/DLL',
-                    "/DEF:{ "$dist-path/src/exports.def".IO.absolute }",
-                    "/OUT:{ $out.absolute }", |@objects;
+            #
+            # cl-as-linker-driver, NOT a bare `link`: on a Git Bash
+            # runner `link` resolves to GNU coreutils' link(1) (the
+            # hard-link utility), which greets /DEF:… with "extra
+            # operand". `cl` survives the same PATH because nothing else
+            # is called cl — and cl invokes its OWN sibling link.exe,
+            # located next to itself rather than searched for on PATH,
+            # so this is immune by construction. Same shadowing class as
+            # the GNU-tar trap in !tar-argv; don't "simplify" it back.
+            #
+            # /LD makes it a DLL (cl passes /DLL on for us). Everything
+            # after /link goes to the linker verbatim, so /link MUST be
+            # last, with only linker options behind it.
+            @link = 'cl', '/nologo', '/LD', |@objects,
+                    "/Fe:{ $out.absolute }",
+                    '/link',
+                    "/DEF:{ "$dist-path/src/exports.def".IO.absolute }";
             # MSVC Release doesn't embed a PDB by default; nothing to strip.
         }
         elsif $darwin {
@@ -878,7 +892,10 @@ class Build {
 
         say "  Linking { $out.basename } from { @objects.elems } objects…";
         my $rc = run |@link;
-        die "❌ Failed linking { $out.basename }." unless $rc.exitcode == 0;
+        unless $rc.exitcode == 0 {
+            die "❌ Failed linking { $out.basename }.\n"
+              ~ "    { @link.join(' ') }";
+        }
 
         # Non-fatal: strip failing just leaves a slightly larger lib.
         run |@strip if @strip;

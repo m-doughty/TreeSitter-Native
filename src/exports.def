@@ -1,6 +1,8 @@
 ; exports.def — the authoritative export list for libtreesitter-native.dll.
 ;
-; Handed to `link /DLL /DEF:src\exports.def`. Every symbol Raku binds
+; Handed to the linker as `cl /LD <objs> /Fe:… /link /DEF:src\exports.def`
+; — cl drives its own sibling link.exe, because a bare `link` on a
+; Git Bash PATH is GNU coreutils' link(1). Every symbol Raku binds
 ; must appear here; the TSN_EXPORT macro in ts_shim.h supplies the
 ; matching __declspec(dllexport) at each definition, and the two lists
 ; must stay in step.
