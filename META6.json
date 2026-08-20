@@ -4,11 +4,12 @@
     "Matt Doughty"
   ],
   "build": "Build.rakumod",
-  "build-depends": [],
+  "build-depends": [
+  ],
   "depends": [
     "NativeCall"
   ],
-  "description": "Raku bindings for tree-sitter: incremental parsing, tree navigation and queries for nine bundled grammars",
+  "description": "parse and navigate source code with tree-sitter",
   "license": "Artistic-2.0",
   "name": "TreeSitter::Native",
   "perl": "6.d",
@@ -71,6 +72,7 @@
     "query",
     "highlighting"
   ],
-  "test-depends": [],
+  "test-depends": [
+  ],
   "version": "0.1.0"
 }

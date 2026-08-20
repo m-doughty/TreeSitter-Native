@@ -1,0 +1,67 @@
+Revision history for TreeSitter::Native
+
+{{$NEXT}}
+
+0.1.0  2026-08-20T22:33:34+01:00
+    - Initial release: tree-sitter 0.26.12 runtime plus the c, cpp,
+      python, javascript, typescript, tsx, go, rust and java grammars,
+      compiled into one native library behind a `tsn_*` C shim. No
+      tree-sitter CLI, no dynamic grammar loading, no system library.
+    - Ergonomic layer in TreeSitter::Native: Parser, Tree, Node and
+      Cursor, with idempotent .dispose plus DESTROY on everything that
+      owns a C allocation. Nodes are value objects (=== and hashing
+      work), keep their Tree alive, and return the Node type object
+      rather than a null node so `with`, `//` and `andthen` compose.
+      Trees outlive the Parser that made them; using a Node after its
+      Tree was explicitly disposed throws instead of reading freed
+      memory.
+    - Byte-offset doctrine throughout: every offset is a byte offset
+      into the UTF-8 encoding of the source. Parser.parse encodes once
+      and the Tree keeps the buffer; Node.text slices and decodes it,
+      Node.byte-slice hands back the raw bytes. Parser.parse-bytes
+      accepts a Blob, including one that is not valid UTF-8.
+    - TreeSitter::Native::Query: compiled queries, lazy Seq of matches
+      or flattened captures, byte-range restriction, and query cursors
+      you can drive yourself. Predicates are EVALUATED — #eq?,
+      #not-eq?, #match?, #not-match?, #any-of?, #not-any-of? — because
+      the C library only parses them, and the bundled javascript
+      tags.scm reports every `constructor` and every `require()`
+      wrongly without them. Unknown predicates are rejected at
+      construction unless :lenient; `!`-directives are parsed and
+      exposed structurally but never applied.
+    - #match? patterns are translated from Perl/PCRE syntax into Raku
+      regex source at query construction (Raku has no runtime P5 regex
+      short of EVAL, and handing an untrusted pattern to `<$str>` would
+      execute it). Untranslatable constructs are a construction-time
+      error, never a silently different match.
+    - Typed failures: X::TreeSitter::Query carries a QueryErrorKind, a
+      byte offset into the query source, and derived line, column and
+      snippet. TreeSitter::Native::Types exports that class and the
+      QueryErrorKind, PredicateStepType, SymbolType and InputEncoding
+      enums.
+    - TreeSitter::Native::Languages: the nine grammars by name, with
+      languages(), is-language(), language(), language-abi(), and
+      accessors for each grammar's vendored .scm queries —
+      tags-query(), highlights-query(), query-source(), query-kinds().
+      Unknown names die listing every valid one.
+    - TreeSitter::Native::FFI: ~82 raw tsn_* bindings, handle types and
+      the 32-byte TSNodeBuf, with a load-time assertion that
+      sizeof(TSNode) in the compiled library matches the Raku struct.
+      Library resolution is TREESITTER_NATIVE_LIB (absolute path,
+      verbatim) then the staged resource, and nothing else.
+    - Prebuilt binaries for macOS (universal), Linux x86_64/aarch64
+      (glibc 2.35) and Windows x86_64/arm64, SHA-256 verified against
+      the bundled resources/checksums.txt, with a source-compile
+      fallback driven by the pins in SOURCE_PINS: nine verified tag
+      archives, 17 translation units compiled with per-translation-unit
+      include isolation, one link. Old glibc and musl skip the prebuilt
+      and compile. Env knobs: TREESITTER_NATIVE_BUILD_FROM_SOURCE,
+      _BINARY_ONLY, _BINARY_URL, _CACHE_DIR, _VENDOR_DIR (offline and
+      air-gapped installs) and the runtime _LIB.
+    - Vendored upstream tag and highlight queries under
+      resources/queries/, plus every upstream licence.
+    - 652 tests across ten files, covering the FFI surface, all nine
+      grammars, UTF-8 and CRLF offsets, RAII and use-after-dispose,
+      query predicates and the regex translator, error kinds and
+      offsets, cursor/recursive-walk equivalence, and offline library
+      resolution for all three platform library names.
